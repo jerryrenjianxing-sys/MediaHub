@@ -59,7 +59,42 @@ async function powershellJson(script, params = {}) {
   const result = await runProcess(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', command], { input: JSON.stringify(params), timeout: 45000 });
   return JSON.parse(result.stdout.trim().replace(/^\uFEFF/, ''));
 }
-const REGISTRY_SCRIPT = `$items=@();$direct=@();foreach($base in @('HKCU:\\Software','HKCU:\\Software\\WOW6432Node')){foreach($name in @('${GUID}','{${GUID}}','com.mediahub','com.mediahub.desktop')){$key=Join-Path $base $name;if(Test-Path -LiteralPath $key){$value=Get-ItemProperty -LiteralPath $key;$direct+=@{key=$name;displayName='MediaHub';version=$value.DisplayVersion;installLocation=$value.InstallLocation;shortcutName=$value.ShortcutName;menuDirectory=$value.MenuDirectory;kind='install-root'}}}};$items+=$direct;foreach($base in @('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKCU:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall')){if(Test-Path -LiteralPath $base){foreach($key in Get-ChildItem -LiteralPath $base){$value=Get-ItemProperty -LiteralPath $key.PSPath;if($key.PSChildName -match '${GUID}|com\\.mediahub' -or $value.DisplayName -match '^MediaHub(?:$|\\s)' -or $value.UninstallString -match 'com\\.mediahub'){$location=$value.InstallLocation;if(-not $location){$match=@($direct|Where-Object{($_.key -replace '[{}]','') -eq ($key.PSChildName -replace '[{}]','')});if($match.Count -eq 0 -and $direct.Count -eq 1){$match=@($direct)};if($match.Count -eq 1){$location=$match[0].installLocation}};$items+=@{key=$key.PSChildName;displayName=$value.DisplayName;version=$value.DisplayVersion;installLocation=$location;uninstallString=$value.UninstallString;quietUninstallString=$value.QuietUninstallString;kind='uninstall'}}}}};ConvertTo-Json -InputObject @($items) -Compress`;
+const REGISTRY_SCRIPT = `
+$items=@();$direct=@()
+function Read-StableRegistration($key) {
+  $value=Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+  if(-not $value -and (Test-Path -LiteralPath $key)){throw 'A live registration is present but unreadable'}
+  return $value
+}
+foreach($base in @('HKCU:\\Software','HKCU:\\Software\\WOW6432Node')){
+  foreach($name in @('${GUID}','{${GUID}}','com.mediahub','com.mediahub.desktop')){
+    $key=Join-Path $base $name
+    if(Test-Path -LiteralPath $key){
+      $value=Read-StableRegistration $key
+      if(-not $value){continue}
+      $direct+=@{key=$name;displayName='MediaHub';version=$value.DisplayVersion;installLocation=$value.InstallLocation;shortcutName=$value.ShortcutName;menuDirectory=$value.MenuDirectory;kind='install-root'}
+    }
+  }
+}
+$items+=$direct
+foreach($base in @('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKCU:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall')){
+  if(Test-Path -LiteralPath $base){
+    foreach($key in Get-ChildItem -LiteralPath $base){
+      $value=Read-StableRegistration $key.PSPath
+      if(-not $value){continue}
+      if($key.PSChildName -match '${GUID}|com\\.mediahub' -or $value.DisplayName -match '^MediaHub(?:$|\\s)' -or $value.UninstallString -match 'com\\.mediahub'){
+        $location=$value.InstallLocation
+        if(-not $location){
+          $match=@($direct|Where-Object{($_.key -replace '[{}]','') -eq ($key.PSChildName -replace '[{}]','')})
+          if($match.Count -eq 0 -and $direct.Count -eq 1){$match=@($direct)}
+          if($match.Count -eq 1){$location=$match[0].installLocation}
+        }
+        $items+=@{key=$key.PSChildName;displayName=$value.DisplayName;version=$value.DisplayVersion;installLocation=$location;uninstallString=$value.UninstallString;quietUninstallString=$value.QuietUninstallString;kind='uninstall'}
+      }
+    }
+  }
+}
+ConvertTo-Json -InputObject @($items) -Compress`;
 async function registryEntries() { return powershellJson(REGISTRY_SCRIPT); }
 function assertRegistryIsolation(entries, root = ACCEPTANCE_ROOT) {
   for (const entry of entries) {

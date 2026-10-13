@@ -20,10 +20,11 @@ function writeJson(file, value) { fs.writeFileSync(file, JSON.stringify(value, n
 async function sha256(file) { const hash = crypto.createHash('sha256'); for await (const chunk of fs.createReadStream(file)) hash.update(chunk); return hash.digest('hex'); }
 function optionsFor(argv) {
   const result = { runId: 'github-hf-01', version: '0.1.0-preview.2', playwrightModule: process.env.MEDIAHUB_PLAYWRIGHT_MODULE || 'playwright', keepComponent: false };
-  const fields = { '--app-exe': 'appExe', '--run-id': 'runId', '--expected-version': 'version', '--playwright-module': 'playwrightModule' };
+  const fields = { '--app-exe': 'appExe', '--run-id': 'runId', '--expected-version': 'version', '--expected-platform-version': 'platformVersion', '--playwright-module': 'playwrightModule' };
   for (let i = 0; i < argv.length; i++) { if (argv[i] === '--help') return { help: true }; if (argv[i] === '--keep-component') { result.keepComponent = true; continue; } const name = fields[argv[i]]; assert.ok(name && argv[i + 1] && !argv[i + 1].startsWith('--'), `Invalid option: ${argv[i]}`); result[name] = argv[++i]; }
   assert.ok(result.appExe, 'Required: --app-exe'); result.appExe = path.resolve(result.appExe);
   assert.match(result.runId, /^[a-zA-Z0-9-]{1,60}$/); assert.match(result.version, /^\d+\.\d+\.\d+-preview\.\d+$/);
+  result.platformVersion ||= result.version; assert.match(result.platformVersion, /^\d+\.\d+\.\d+-preview\.\d+$/);
   assert.ok(within(path.join(ROOT, 'release'), result.appExe) || within(path.join(ROOT, 'work'), result.appExe), 'Use an actual packaged acceptance app under release or work'); assert.equal(path.basename(result.appExe).toLowerCase(), 'mediahub.exe');
   return result;
 }
@@ -53,14 +54,14 @@ function publicReport(value) {
 
 async function main(argv = process.argv.slice(2)) {
   const options = optionsFor(argv);
-  if (options.help) { console.log('Usage: node scripts/accept-studio.cjs --app-exe release/win-unpacked/MediaHub.exe [--run-id github-hf-01] [--expected-version 0.1.0-preview.2] [--playwright-module <existing Playwright package>] [--keep-component]\nRequires completed real v1/v2 component acceptance and its verified GitHub cache. Starts only its own loopback-CDP app, modifies and restores only the isolated test composition, then normally stops/uninstalls the component and quits. Never run concurrently with installer acceptance.'); return; }
+  if (options.help) { console.log('Usage: node scripts/accept-studio.cjs --app-exe release/win-unpacked/MediaHub.exe [--run-id github-hf-01] [--expected-version <component .2>] [--expected-platform-version <platform .3>] [--playwright-module <existing Playwright package>] [--keep-component]\nRequires completed real v1/v2 component acceptance and its verified GitHub cache. Starts only its own loopback-CDP app, modifies and restores only the isolated test composition, then normally stops/uninstalls the component and quits. Never run concurrently with installer acceptance.'); return; }
   assert.equal(process.platform, 'win32'); await noRunningPlatform();
   const { chromium } = require(options.playwrightModule);
   const profileRoot = path.join(BASE, options.runId); assert.ok(within(fs.realpathSync(BASE), fs.realpathSync(profileRoot)));
   const profileFile = path.join(profileRoot, 'profile.json'); const profile = readJson(profileFile); const checkpoint = readJson(path.join(profileRoot, 'checkpoint.json')); const upgradeReport = readJson(path.join(profileRoot, 'upgrade-v2.public.json'));
   assert.equal(profile.acceptance, true); assert.equal(checkpoint.phase1Passed, true); assert.equal(upgradeReport.passed, true); assert.equal(upgradeReport.toolVersion, options.version);
   assert.equal(path.resolve(profile.dataRoot).toLowerCase(), path.join(profileRoot, 'data').toLowerCase()); assert.equal(path.resolve(profile.workspaceRoot).toLowerCase(), path.join(profileRoot, '共享 项目与素材').toLowerCase());
-  const appDir = path.dirname(fs.realpathSync(options.appExe)); const pe = await exeVersion(options.appExe); assert.equal(pe.productName, 'MediaHub'); assert.equal(pe.fileVersion, options.version);
+  const appDir = path.dirname(fs.realpathSync(options.appExe)); const pe = await exeVersion(options.appExe); assert.equal(pe.productName, 'MediaHub'); assert.equal(pe.fileVersion, options.platformVersion);
   const signed = readJson(path.join(profile.dataRoot, 'catalog.signed.json')); const catalog = verifyEnvelope(signed, fs.readFileSync(path.join(appDir, 'resources/resources/catalog-public.pem'), 'utf8')); const descriptor = catalog.tools.find(t => t.id === 'hyperframes'); assert.equal(descriptor.version, options.version);
   assert.ok(descriptor.package.url.startsWith('https://github.com/jerryrenjianxing-sys/MediaHub/releases/download/'));
   const cached = path.join(profile.dataRoot, 'downloads', `hyperframes-${options.version}-${descriptor.package.sha256.slice(0, 12)}.zip`); assert.equal(fs.statSync(cached).size, descriptor.package.bytes); assert.equal(await sha256(cached), descriptor.package.sha256);
@@ -99,7 +100,7 @@ async function main(argv = process.argv.slice(2)) {
     await platformPage.waitForFunction(() => !!window.mediaHub);
     assert.deepEqual(await platformPage.evaluate(() => ({ bridge: typeof window.mediaHub.openStudio, require: typeof window.require, process: typeof window.process })), { bridge: 'function', require: 'undefined', process: 'undefined' }); let snapshot;
     for (let attempt = 0; attempt < 100; attempt++) { snapshot = await call('platform.snapshot'); if (snapshot.connection.available) break; await pause(100); }
-    assert.equal(snapshot.version, options.version); assert.equal(snapshot.connection.profile, 'acceptance'); assert.equal(path.resolve(snapshot.workspace.path).toLowerCase(), path.resolve(profile.workspaceRoot).toLowerCase()); assert.ok(snapshot.projects.some(p => p.id === project.id));
+    assert.equal(snapshot.version, options.platformVersion); assert.equal(snapshot.connection.profile, 'acceptance'); assert.equal(path.resolve(snapshot.workspace.path).toLowerCase(), path.resolve(profile.workspaceRoot).toLowerCase()); assert.ok(snapshot.projects.some(p => p.id === project.id));
     const tool = snapshot.tools.find(tool => tool.id === 'hyperframes'); assert.equal(tool.status, 'not-installed', 'This UI acceptance begins after the real component uninstall');
     const install = await call('tools.install', { toolId: 'hyperframes' }); await waitTask(install.id); snapshot = await call('platform.snapshot'); assert.equal(snapshot.tools.find(tool => tool.id === 'hyperframes').installedVersion, options.version);
     report.installation = { reusedVerifiedGithubDownloadCache: true, freshDownloadClaimed: false, packageSha256: descriptor.package.sha256, packageBytes: descriptor.package.bytes }; pass('复用先前真实 GitHub 校验缓存安装', { freshDownloadClaimed: false });
