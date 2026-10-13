@@ -43,6 +43,10 @@ async function main() {
   ensureDir(acceptanceRoot);
   const downloads = ensureDir(path.join(acceptanceRoot, 'download-cache'));
   const applicationsRoot = ensureDir(path.join(acceptanceRoot, '应用 中文 空格'));
+  const mediaFlowPathMode = process.env.MEDIAHUB_MEDIAFLOW_PATH || 'unicode';
+  assert.ok(['unicode', 'ascii'].includes(mediaFlowPathMode), 'Unknown MediaFlow installation path test mode');
+  const mediaFlowApplicationsRoot = mediaFlowPathMode === 'ascii' ? ensureDir(path.join(acceptanceRoot, 'Applications with spaces')) : applicationsRoot;
+  const applicationRootFor = tool => tool.id === 'mediaflow' ? mediaFlowApplicationsRoot : applicationsRoot;
   const evidenceRoot = ensureDir(path.join(acceptanceRoot, 'evidence'));
   const logsRoot = ensureDir(path.join(acceptanceRoot, 'logs'));
   const preservedRoot = ensureDir(path.join(acceptanceRoot, '留存资料'));
@@ -50,7 +54,7 @@ async function main() {
   const mediaFlowProfilePath = path.join(originalProfilesRoot, 'mediaflow-instance.json');
   atomicJson(mediaFlowProfilePath, {
     schema: 1, id: 'mediahub_acceptance', acceptance: true,
-    install_root: path.join(applicationsRoot, 'mediaflow'),
+    install_root: path.join(mediaFlowApplicationsRoot, 'mediaflow'),
     data_root: path.join(originalProfilesRoot, 'mediaflow', 'data'),
     ui_port: 30351, api_port: 48351, stream_port: 48352,
     task_name: 'MediaHub CI MediaFlow Acceptance', shortcut_name: 'MediaFlow MediaHub CI Acceptance',
@@ -68,6 +72,11 @@ async function main() {
   assert.ok(selectedTool === 'all' || approvedExternalTools.some(tool => tool.id === selectedTool), 'Unknown requested acceptance tool');
   const externalTools = selectedTool === 'all' ? approvedExternalTools : approvedExternalTools.filter(tool => tool.id === selectedTool);
   const report = { schema: 3, startedAt: new Date().toISOString(), completedAt: null, passed: false, profile: 'disposable-github-hosted-windows', selectedTool, fullThreeToolAcceptance: externalTools.length === 3, run: { id: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, sha: process.env.GITHUB_SHA }, isolationRoot: acceptanceRoot, tests: [], tools: [], limits: ['Installation, identity, first opening and original-management handoff only; no business workflow, account login, update installation or actual uninstall is performed.'] };
+  report.mediaFlowPathMode = mediaFlowPathMode;
+  if (mediaFlowPathMode === 'ascii') {
+    report.limits.push('MediaFlow installs into an explicitly isolated ASCII path containing spaces. Its original 0.4.1-dev.48 installer failed on a Unicode path in separate real clean Windows tests; ASCII success does not establish Unicode installation support. Shared workspace remains a Unicode path containing spaces.');
+    report.knownUnicodeInstallationFailure = { product: 'MediaFlow', version: '0.4.1-dev.48', originalHelper: 'install-mediaflow-background.ps1', line: 38, operation: 'WScript.Shell shortcut.TargetPath assignment', hresult: '0x80070057', evidence: ['https://github.com/jerryrenjianxing-sys/MediaHub/actions/runs/38371037238', 'https://github.com/jerryrenjianxing-sys/MediaHub/actions/runs/38374063016'] };
+  }
   let manager;
   const startedTools = new Set();
   const saveReport = () => atomicJson(path.join(acceptanceRoot, 'report.json'), report);
@@ -81,7 +90,7 @@ async function main() {
     if (fs.existsSync(parent)) for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.isSymbolicLink() || !['.candidate-', '.failed-'].some(suffix => entry.name.startsWith(path.basename(destination) + suffix))) continue;
       const candidate = path.join(parent, entry.name);
-      if (!within(applicationsRoot, candidate)) continue;
+      if (!within(applicationRootFor(tool), candidate)) continue;
       const identity = await findInstalled(tool, candidate);
       diagnostics.candidateDirectories.push({ path: candidate, identity });
     }
@@ -156,7 +165,7 @@ async function main() {
     return powershellJson("$items=@();foreach($p in Get-CimInstance Win32_Process -ErrorAction SilentlyContinue){if($p.ExecutablePath -and [string]::Equals($p.ExecutablePath,$inputRecord.path,[StringComparison]::OrdinalIgnoreCase)){try{$live=Get-Process -Id $p.ProcessId -ErrorAction Stop;$items+=@{pid=$p.ProcessId;parentPid=$p.ParentProcessId;executable=$p.ExecutablePath;windowHandle=$live.MainWindowHandle.ToInt64();windowTitle=$live.MainWindowTitle;startedAt=$live.StartTime.ToUniversalTime().ToString('o')}}catch{}}};ConvertTo-Json -InputObject @($items) -Compress", { path: installPath });
   }
   async function observeFirstOpen(tool, installed, action) {
-    assert.ok(within(applicationsRoot, installed.installPath), 'Only the isolated original installation may open');
+    assert.ok(within(applicationRootFor(tool), installed.installPath), 'Only the isolated original installation may open');
     const result = resultFor(tool.id);
     const launchArgs = tool.id === 'mediaflow' ? [`--instance-profile=${mediaFlowProfilePath}`] : [];
     const launchEnv = { ...process.env, DO_NOT_TRACK: '1', ELECTRON_ENABLE_LOGGING: '1' };
@@ -229,7 +238,7 @@ async function main() {
     const actualChecksum = await sha256(installer);
     assert.equal(actualChecksum, tool.install.sha256);
     result.download = { url: tool.install.url, expectedSha256: tool.install.sha256, actualSha256: actualChecksum, bytes: fs.statSync(installer).size, elapsedMs: Date.now() - begin };
-    const destination = path.join(applicationsRoot, tool.id); result.installDirectory = destination;
+    const destination = path.join(applicationRootFor(tool), tool.id); result.installDirectory = destination;
     const logPath = path.join(logsRoot, `${tool.id}-installer.log`);
     const launch = installerArguments(tool.id, destination, logPath, tool.id === 'mediaflow' ? mediaFlowProfilePath : undefined);
     result.installer = { arguments: launch.args, windowsVerbatimArguments: launch.windowsVerbatimArguments, startedAt: new Date().toISOString() }; saveReport();
@@ -253,7 +262,7 @@ async function main() {
     let actual;
     for (let attempt = 0; attempt < 120; attempt++) { actual = await findInstalled(tool, destination); if (actual) break; await pause(1500); }
     assert.ok(actual, `${tool.name}: no verified executable was found in the requested isolated directory`);
-    assert.ok(within(applicationsRoot, fs.realpathSync(actual.installPath)), 'Installer path escaped isolation root');
+    assert.ok(within(applicationRootFor(tool), fs.realpathSync(actual.installPath)), 'Installer path escaped isolation root');
     result.identity = actual; result.actualVersion = actual.version; result.catalogVersion = tool.version;
     assert.notEqual(actual.version, '', 'Actual VersionInfo version must be present');
     saveReport();
@@ -337,7 +346,9 @@ async function main() {
     if (manager) await manager.close();
     // Stop only executables beneath this run's explicitly checked application root.
     if (startedTools.size) {
-      try { report.cleanup = await powershellJson("$stopped=@();$prefix=[IO.Path]::GetFullPath($inputRecord.root).TrimEnd('\\')+'\\';foreach($p in Get-CimInstance Win32_Process -ErrorAction SilentlyContinue){if($p.ExecutablePath -and $p.ExecutablePath.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase)){try{Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop;$stopped+=$p.ProcessId}catch{}}};@{stoppedPids=$stopped;programsAndDataDeleted=$false}|ConvertTo-Json -Compress", { root: applicationsRoot }); } catch (error) { report.cleanup = { error: error.message }; }
+      const ownedProgramRoots = [...new Set([applicationsRoot, mediaFlowApplicationsRoot])];
+      assert.ok(ownedProgramRoots.every(root => within(acceptanceRoot, root)), 'Cleanup program roots must remain inside acceptance isolation');
+      try { report.cleanup = await powershellJson("$stopped=@();$prefixes=@($inputRecord.roots|ForEach-Object{[IO.Path]::GetFullPath($_).TrimEnd('\\')+'\\'});foreach($p in Get-CimInstance Win32_Process -ErrorAction SilentlyContinue){if($p.ExecutablePath -and @($prefixes|Where-Object{$p.ExecutablePath.StartsWith($_,[StringComparison]::OrdinalIgnoreCase)}).Count){try{Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop;$stopped+=$p.ProcessId}catch{}}};@{stoppedPids=$stopped;programsAndDataDeleted=$false}|ConvertTo-Json -Compress", { roots: ownedProgramRoots }); } catch (error) { report.cleanup = { error: error.message }; }
     }
     report.completedAt = new Date().toISOString(); saveReport();
     console.log(`Legacy acceptance ${report.passed ? 'passed' : 'failed'}; report: ${path.join(acceptanceRoot, 'report.json')}`);

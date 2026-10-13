@@ -12,6 +12,14 @@ on:
           - mediaflow
           - media-deep-researcher
           - mediasail
+      mediaflow_path:
+        description: 'MediaFlow isolated install path: Unicode failure coverage or ASCII compatibility coverage'
+        type: choice
+        required: true
+        default: unicode
+        options:
+          - unicode
+          - ascii
 permissions:
   contents: read
 jobs:
@@ -20,6 +28,7 @@ jobs:
     timeout-minutes: 120
     env:
       MEDIAHUB_LEGACY_TOOL: ${{ inputs.tool }}
+      MEDIAHUB_MEDIAFLOW_PATH: ${{ inputs.mediaflow_path }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

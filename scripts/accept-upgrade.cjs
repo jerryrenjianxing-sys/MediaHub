@@ -59,7 +59,7 @@ async function powershellJson(script, params = {}) {
   const result = await runProcess(executable, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', command], { input: JSON.stringify(params), timeout: 45000 });
   return JSON.parse(result.stdout.trim().replace(/^\uFEFF/, ''));
 }
-const REGISTRY_SCRIPT = `$items=@();$direct=@();foreach($base in @('HKCU:\\Software','HKCU:\\Software\\WOW6432Node')){foreach($name in @('${GUID}','{${GUID}}','com.mediahub','com.mediahub.desktop')){$key=Join-Path $base $name;if(Test-Path -LiteralPath $key){$value=Get-ItemProperty -LiteralPath $key;$direct+=@{key=$name;displayName='MediaHub';version=$value.DisplayVersion;installLocation=$value.InstallLocation;kind='install-root'}}}};$items+=$direct;foreach($base in @('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKCU:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall')){if(Test-Path -LiteralPath $base){foreach($key in Get-ChildItem -LiteralPath $base){$value=Get-ItemProperty -LiteralPath $key.PSPath;if($key.PSChildName -match '${GUID}|com\\.mediahub' -or $value.DisplayName -match '^MediaHub(?:$|\\s)' -or $value.UninstallString -match 'com\\.mediahub'){$location=$value.InstallLocation;if(-not $location){$match=@($direct|Where-Object{($_.key -replace '[{}]','') -eq ($key.PSChildName -replace '[{}]','')});if($match.Count -eq 0 -and $direct.Count -eq 1){$match=@($direct)};if($match.Count -eq 1){$location=$match[0].installLocation}};$items+=@{key=$key.PSChildName;displayName=$value.DisplayName;version=$value.DisplayVersion;installLocation=$location;uninstallString=$value.UninstallString;kind='uninstall'}}}}};ConvertTo-Json -InputObject @($items) -Compress`;
+const REGISTRY_SCRIPT = `$items=@();$direct=@();foreach($base in @('HKCU:\\Software','HKCU:\\Software\\WOW6432Node')){foreach($name in @('${GUID}','{${GUID}}','com.mediahub','com.mediahub.desktop')){$key=Join-Path $base $name;if(Test-Path -LiteralPath $key){$value=Get-ItemProperty -LiteralPath $key;$direct+=@{key=$name;displayName='MediaHub';version=$value.DisplayVersion;installLocation=$value.InstallLocation;shortcutName=$value.ShortcutName;menuDirectory=$value.MenuDirectory;kind='install-root'}}}};$items+=$direct;foreach($base in @('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKCU:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall')){if(Test-Path -LiteralPath $base){foreach($key in Get-ChildItem -LiteralPath $base){$value=Get-ItemProperty -LiteralPath $key.PSPath;if($key.PSChildName -match '${GUID}|com\\.mediahub' -or $value.DisplayName -match '^MediaHub(?:$|\\s)' -or $value.UninstallString -match 'com\\.mediahub'){$location=$value.InstallLocation;if(-not $location){$match=@($direct|Where-Object{($_.key -replace '[{}]','') -eq ($key.PSChildName -replace '[{}]','')});if($match.Count -eq 0 -and $direct.Count -eq 1){$match=@($direct)};if($match.Count -eq 1){$location=$match[0].installLocation}};$items+=@{key=$key.PSChildName;displayName=$value.DisplayName;version=$value.DisplayVersion;installLocation=$location;uninstallString=$value.UninstallString;quietUninstallString=$value.QuietUninstallString;kind='uninstall'}}}}};ConvertTo-Json -InputObject @($items) -Compress`;
 async function registryEntries() { return powershellJson(REGISTRY_SCRIPT); }
 function assertRegistryIsolation(entries, root = ACCEPTANCE_ROOT) {
   for (const entry of entries) {
@@ -73,6 +73,44 @@ async function assertNoRunningPlatform() {
 }
 async function exeVersion(file) {
   return powershellJson('$value=(Get-Item -LiteralPath $inputRecord.path).VersionInfo;@{fileVersion=$value.FileVersion;productVersion=$value.ProductVersion;productName=$value.ProductName;fileDescription=$value.FileDescription}|ConvertTo-Json -Compress', { path: file });
+}
+function cleanupTarget(entries, installRoot, root = ACCEPTANCE_ROOT) {
+  assertRegistryIsolation(entries, root);
+  assert.ok(entries.length > 0, 'No registered acceptance installation can be verified for cleanup');
+  assert.ok(within(root, installRoot) && path.resolve(root).toLowerCase() !== path.resolve(installRoot).toLowerCase(), 'Cleanup target must be a child of the acceptance directory');
+  for (const entry of entries) assert.equal(path.resolve(entry.installLocation).toLowerCase(), path.resolve(installRoot).toLowerCase(), 'MediaHub registration belongs to another install root; refusing cleanup');
+  const uninstallEntries = entries.filter(entry => entry.kind === 'uninstall');
+  assert.equal(uninstallEntries.length, 1, 'Cleanup requires exactly one verifiable MediaHub uninstall registration');
+  const record = uninstallEntries[0];
+  // Verified electron-builder 26.17.0 NSIS common.nsh/installer.nsh contract:
+  // Uninstall ${PRODUCT_FILENAME}.exe, quoted registry path, /currentuser.
+  const parsed = String(record.uninstallString || '').match(/^"([^"\r\n]+)"\s+\/currentuser\s*$/i);
+  assert.ok(parsed && path.isAbsolute(parsed[1]), 'Registered uninstaller command is not the verified current-user NSIS contract');
+  const executable = path.resolve(parsed[1]);
+  assert.equal(path.dirname(executable).toLowerCase(), path.resolve(installRoot).toLowerCase(), 'Registered uninstaller is outside the owned application directory');
+  assert.equal(path.basename(executable).toLowerCase(), 'uninstall mediahub.exe', 'Registered uninstaller name differs from the MediaHub NSIS contract');
+  if (record.quietUninstallString) {
+    const quiet = String(record.quietUninstallString).match(/^"([^"\r\n]+)"\s+\/currentuser\s+\/S\s*$/i);
+    assert.ok(quiet && path.resolve(quiet[1]).toLowerCase() === executable.toLowerCase(), 'Quiet uninstall registration differs from the verified uninstaller');
+  }
+  return { executable, args: ['/currentuser', '/S'] };
+}
+function assertUninstallerIdentity(info, expectedVersion) {
+  assert.equal(info.productName, 'MediaHub', 'Uninstaller PE identity is not MediaHub');
+  assert.match(String(info.fileDescription || ''), /^MediaHub(?:$|\s)/, 'Uninstaller PE description is not MediaHub');
+  // NSIS uninstaller uses shortVersion in its PE resources, unlike the app PE.
+  const expectedBase = expectedVersion.split('-')[0];
+  const actual = String(info.fileVersion || '').trim();
+  assert.ok(actual === expectedBase || actual === `${expectedBase}.0`, 'Uninstaller PE version differs from the acceptance release');
+}
+async function registeredShortcuts(entries, installRoot) {
+  const registration = entries.find(entry => entry.kind === 'install-root');
+  assert.ok(registration && typeof registration.shortcutName === 'string' && /^[^\\/:"\x00-\x1f]{1,120}$/.test(registration.shortcutName), 'Missing verifiable NSIS shortcut name');
+  const menuDirectory = registration.menuDirectory || '';
+  assert.ok(typeof menuDirectory === 'string' && !path.isAbsolute(menuDirectory) && !menuDirectory.split(/[\\/]/).some(part => part === '..') && !/[\x00-\x1f:"]/.test(menuDirectory), 'Invalid registered Start menu directory');
+  const links = await powershellJson('$shell=New-Object -ComObject WScript.Shell;$desktop=[Environment]::GetFolderPath("DesktopDirectory");$programs=[Environment]::GetFolderPath("Programs");$menu=$programs;if($inputRecord.menuDirectory){$menu=Join-Path $programs $inputRecord.menuDirectory};$items=@();foreach($link in @((Join-Path $desktop ($inputRecord.shortcutName+".lnk")),(Join-Path $menu ($inputRecord.shortcutName+".lnk")))){$exists=Test-Path -LiteralPath $link;$target=$null;if($exists){$target=$shell.CreateShortcut($link).TargetPath};$items+=@{path=$link;exists=$exists;target=$target}};ConvertTo-Json -InputObject @($items) -Compress', { shortcutName: registration.shortcutName, menuDirectory });
+  for (const link of links) if (link.exists) assert.equal(path.resolve(link.target || '').toLowerCase(), path.join(installRoot, 'MediaHub.exe').toLowerCase(), 'MediaHub shortcut points outside the owned acceptance app; refusing cleanup');
+  return links;
 }
 function matchesVersion(info, expected) { return String(info.fileVersion || '').trim() === expected; }
 function normalizedUrl(value) { if (value && typeof value === 'object') value = value.url || value.href; if (typeof value !== 'string') return null; try { return new URL(value).href; } catch { return null; } }
@@ -99,8 +137,13 @@ async function realFeedEvidence(expectedVersion, expectedDownloadUrl) {
   throw lastError;
 }
 function safePublicError(message) { return String(message || '').replaceAll(REPO_ROOT, '<repo>').replaceAll(REPO_ROOT.replaceAll('\\', '/'), '<repo>').replaceAll(os.homedir(), '<user>').replace(/[A-Za-z]:[\\/][^\n\r"']*/g, '<local-path>'); }
+function publicCleanup(value) {
+  if (!value) return null;
+  const info = value.uninstallerVersionInfo;
+  return { passed: value.passed, realNsisUninstaller: value.realNsisUninstaller, uninstallerFileName: path.basename(value.uninstallerFileName), uninstallerVersionInfo: info && { fileVersion: info.fileVersion, productVersion: info.productVersion, productName: info.productName, fileDescription: info.fileDescription }, uninstallerSha256: value.uninstallerSha256, uninstallerExitCode: value.uninstallerExitCode, registryCleared: value.registryCleared, noMediaHubProcesses: value.noMediaHubProcesses, installDirectoryRemoved: value.installDirectoryRemoved, shortcutLocationsChecked: value.shortcutLocationsChecked, shortcutsRemoved: value.shortcutsRemoved, profileRetained: value.profileRetained, workspaceRetained: value.workspaceRetained, chineseProjectRetained: value.chineseProjectRetained, projectMetadataRetained: value.projectMetadataRetained, themeRetained: value.themeRetained, sentinelRetained: value.sentinelRetained };
+}
 function publicReport(report) {
-  return { schema: report.schema, passed: report.passed, startedAt: report.startedAt, completedAt: report.completedAt, profile: 'isolated-packaged-Windows-upgrade', fromVersion: report.fromVersion, expectedVersion: report.expectedVersion, feed: report.feed, initial: report.initial && { installerFileName: path.basename(report.initial.installer), installerSha256: report.initial.installerSha256, installerBytes: report.initial.installerBytes, versionInfo: report.initial.versionInfo, executableSha256: report.initial.executableSha256, snapshotVersion: report.initial.snapshotVersion, fourToolsNotInstalled: report.initial.fourToolsNotInstalled }, download: report.download && { url: report.download.url, expectedSha256: report.download.expectedSha256, actualSha256: report.download.actualSha256, bytes: report.download.bytes, fileName: path.basename(report.download.path) }, upgrade: report.upgrade && { accepted: report.upgrade.accepted, targetVersion: report.upgrade.targetVersion, status: report.upgrade.status, oldProcessExitConfirmed: report.upgrade.oldProcessExitConfirmed, versionInfo: report.upgrade.versionInfo, executableSha256: report.upgrade.executableSha256, snapshotVersion: report.upgrade.snapshotVersion, registryVersionConfirmed: report.upgrade.registryVersionConfirmed }, persistence: report.persistence, tests: report.tests, error: report.error ? { message: safePublicError(report.error.message) } : undefined };
+  return { schema: report.schema, passed: report.passed, startedAt: report.startedAt, completedAt: report.completedAt, profile: 'isolated-packaged-Windows-upgrade', fromVersion: report.fromVersion, expectedVersion: report.expectedVersion, feed: report.feed, initial: report.initial && { installerFileName: path.basename(report.initial.installer), installerSha256: report.initial.installerSha256, installerBytes: report.initial.installerBytes, versionInfo: report.initial.versionInfo, executableSha256: report.initial.executableSha256, snapshotVersion: report.initial.snapshotVersion, fourToolsNotInstalled: report.initial.fourToolsNotInstalled }, download: report.download && { url: report.download.url, expectedSha256: report.download.expectedSha256, actualSha256: report.download.actualSha256, bytes: report.download.bytes, fileName: path.basename(report.download.path) }, upgrade: report.upgrade && { accepted: report.upgrade.accepted, targetVersion: report.upgrade.targetVersion, status: report.upgrade.status, oldProcessExitConfirmed: report.upgrade.oldProcessExitConfirmed, versionInfo: report.upgrade.versionInfo, executableSha256: report.upgrade.executableSha256, snapshotVersion: report.upgrade.snapshotVersion, registryVersionConfirmed: report.upgrade.registryVersionConfirmed }, persistence: report.persistence, cleanup: publicCleanup(report.cleanup), tests: report.tests, error: report.error ? { message: safePublicError(report.error.message) } : undefined };
 }
 async function findInstaller(updateRoot, receipt, expectedHash) {
   const candidates = [];
@@ -131,7 +174,7 @@ async function main(argv = process.argv.slice(2)) {
   const profilePath = path.join(runRoot, 'profile.json'); const connectionFile = path.join(dataRoot, 'connection.json');
   fs.mkdirSync(runRoot, { recursive: true }); fs.mkdirSync(dataRoot, { recursive: true });
   writeJson(profilePath, { acceptance: true, dataRoot, workspaceRoot });
-  const report = { schema: 1, passed: false, startedAt: new Date().toISOString(), completedAt: null, fromVersion: options.fromVersion, expectedVersion: options.expectedVersion, feed: feedEvidence, initial: null, download: null, upgrade: null, persistence: null, tests: [], paths: { runRoot, dataRoot, workspaceRoot, installRoot, profilePath } };
+  const report = { schema: 1, passed: false, startedAt: new Date().toISOString(), completedAt: null, fromVersion: options.fromVersion, expectedVersion: options.expectedVersion, feed: feedEvidence, initial: null, download: null, upgrade: null, persistence: null, cleanup: null, tests: [], paths: { runRoot, dataRoot, workspaceRoot, installRoot, profilePath } };
   const save = () => { writeJson(path.join(runRoot, 'report.json'), report); writeJson(path.join(runRoot, 'report.public.json'), publicReport(report)); writeJson(path.join(ACCEPTANCE_ROOT, 'latest.public.json'), publicReport(report)); };
   let running = null;
   function startApplication() {
@@ -227,6 +270,26 @@ async function main(argv = process.argv.slice(2)) {
     report.persistence = { projectId: project.id, chineseProjectRetained: true, orientationRetained: true, sameProjectDirectory: true, themeRetained: true, sentinelRetained: true, sentinelSha256: sentinelHash, projectMetadataSha256: projectMetadataHash };
     report.tests.push('asynchronous install receipt before old process exit', 'actual installer replaced PE and registry version', 'same-profile restart reports new actual package version', 'project metadata, theme and sentinel retained');
     await call('platform.quit', { mode: 'wait' }, 15000).catch(error => { if (!/pipe|connection|closed|exit|response/i.test(error.message)) throw error; }); await waitExit(running, 60000); running = null;
+    console.log('Uninstalling only the verified acceptance app through its real NSIS uninstaller.');
+    const cleanupRegistry = await registryEntries(); const cleanup = cleanupTarget(cleanupRegistry, installRoot); await assertNoRunningPlatform();
+    assert.ok(within(fs.realpathSync(ACCEPTANCE_ROOT), fs.realpathSync(installRoot)) && within(fs.realpathSync(installRoot), fs.realpathSync(cleanup.executable)), 'Actual cleanup paths escape the acceptance installation');
+    assert.equal(path.dirname(fs.realpathSync(cleanup.executable)).toLowerCase(), fs.realpathSync(installRoot).toLowerCase(), 'Actual uninstaller is not directly inside the acceptance app');
+    const uninstallerInfo = await exeVersion(cleanup.executable); assertUninstallerIdentity(uninstallerInfo, options.expectedVersion);
+    const uninstallerHash = await sha256(cleanup.executable); const shortcuts = await registeredShortcuts(cleanupRegistry, installRoot); const profileHash = await sha256(profilePath);
+    report.paths.uninstaller = cleanup.executable; report.paths.shortcuts = shortcuts;
+    cleanupTarget(await registryEntries(), installRoot); await assertNoRunningPlatform();
+    const uninstallReceipt = await runProcess(cleanup.executable, cleanup.args, { timeout: 300000, cwd: runRoot });
+    const cleanupDeadline = Date.now() + 180000; let cleaned = false;
+    while (Date.now() < cleanupDeadline) {
+      const entries = await registryEntries(); assertRegistryIsolation(entries);
+      if (entries.length === 0 && !fs.existsSync(installRoot) && shortcuts.every(link => !fs.existsSync(link.path))) { cleaned = true; break; }
+      await pause(500);
+    }
+    assert.ok(cleaned, 'Acceptance uninstaller did not remove the actual app, registry and shortcuts'); await assertNoRunningPlatform();
+    assert.equal(await sha256(profilePath), profileHash, 'Acceptance profile was removed or changed during uninstall');
+    assert.ok(fs.statSync(workspaceRoot).isDirectory()); assert.equal(await sha256(path.join(project.path, 'project.json')), projectMetadataHash); assert.equal(await sha256(sentinel), sentinelHash); assert.equal(readJson(path.join(dataRoot, 'settings.json')).theme, 'dark');
+    report.cleanup = { passed: true, realNsisUninstaller: true, uninstallerFileName: path.basename(cleanup.executable), uninstallerVersionInfo: uninstallerInfo, uninstallerSha256: uninstallerHash, uninstallerExitCode: uninstallReceipt.code, registryCleared: true, noMediaHubProcesses: true, installDirectoryRemoved: true, shortcutLocationsChecked: shortcuts.length, shortcutsRemoved: true, profileRetained: true, workspaceRetained: true, chineseProjectRetained: true, projectMetadataRetained: true, themeRetained: true, sentinelRetained: true };
+    report.tests.push('real current-user NSIS uninstall of guarded acceptance app', 'installation registry and desktop/Start menu shortcuts removed', 'profile, workspace, project metadata, theme and sentinel retained after uninstall');
     report.passed = true; report.completedAt = new Date().toISOString(); save(); console.log('Real GitHub platform upgrade acceptance passed. Public evidence: work/upgrade-acceptance/latest.public.json');
     return report;
   } catch (error) {
@@ -236,5 +299,5 @@ async function main(argv = process.argv.slice(2)) {
   }
 }
 
-module.exports = { parseOptions, installerArguments, within, assertRegistryIsolation, publicReport, matchesVersion, actualDownloadUrl, registryEntries, exeVersion, main };
+module.exports = { parseOptions, installerArguments, within, assertRegistryIsolation, cleanupTarget, assertUninstallerIdentity, publicReport, matchesVersion, actualDownloadUrl, registryEntries, exeVersion, main };
 if (require.main === module) main().catch(error => { console.error(safePublicError(error.message)); process.exitCode = 1; });
