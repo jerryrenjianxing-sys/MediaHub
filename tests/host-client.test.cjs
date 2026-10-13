@@ -17,8 +17,17 @@ async function fixture(t) {
 }
 test('NDJSON task events with id are distinct from RPC replies and completion is normalized', { skip }, async t => {
   const client = await fixture(t); const progress = [];
+  let busyAtCompletion;
+  client.on('task', event => { if (event.status === 'completed') busyAtCompletion = client.busy; });
   const receipt = await client.invoke('render', {}, { taskId: 'task-normal', progress: p => progress.push(p) });
   assert.equal(receipt.status, 'completed'); assert.equal(client.busy, false); assert.equal(progress[0].percent, 57);
+  assert.equal(busyAtCompletion, false, 'quit-wait listeners must see the terminal task as idle');
+});
+
+test('a cancelled request before acceptance never creates a busy waiter', { skip }, async t => {
+  const client = await fixture(t); const controller = new AbortController(); controller.abort();
+  await assert.rejects(client.invoke('render', {}, { taskId: 'task-before', signal: controller.signal }), { name: 'AbortError' });
+  assert.equal(client.busy, false); assert.equal(client.tasks.size, 0);
 });
 test('unknown acceptance receipt is queried without replay and remains busy until terminal event', { skip }, async t => {
   const client = await fixture(t); const request = client.request.bind(client); let renders = 0;

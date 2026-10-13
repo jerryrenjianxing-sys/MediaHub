@@ -164,3 +164,13 @@ test('download rejects a changed body and repairs a corrupt cache using verified
   fs.writeFileSync(target, 'corrupt cache'); served = body;
   await downloadVerified(pkg, target); assert.deepEqual(fs.readFileSync(target), body);
 });
+
+test('a stopped Studio task becomes interrupted and no longer blocks shutdown', async t => {
+  const { manager } = isolated(t); await manager.ready;
+  const project = await manager.call('projects.create', { name: 'service stopped' });
+  const taskId = manager.beginExternalTask({ toolId: 'hyperframes', capabilityId: 'hyperframes.render', projectId: project.id, externalId: 'studio-stopped' });
+  assert.equal(manager.busy, true);
+  manager.updateExternalTask(taskId, { state: 'interrupted', error: { code: 'SERVICE_STOPPED', message: 'unknown result' } });
+  assert.equal(manager.busy, false); assert.equal((await manager.call('tasks.get', { taskId })).state, 'interrupted');
+  assert.deepEqual(await manager.call('artifacts.list'), []); await manager.close();
+});

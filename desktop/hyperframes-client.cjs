@@ -45,7 +45,6 @@ class HyperframesClient extends EventEmitter {
       } else if (message.event === 'task') {
         message.status = { complete: 'completed', rendering: 'running', validating: 'running' }[message.status] || message.status;
         if (['queued', 'running', 'cancelling'].includes(message.status)) this.active.add(message.taskId);
-        this.emit('task', message);
         const terminal = ['completed', 'failed', 'cancelled', 'interrupted'].includes(message.status || message.state);
         if (terminal) {
           this.active.delete(message.taskId);
@@ -53,12 +52,15 @@ class HyperframesClient extends EventEmitter {
           const task = this.tasks.get(message.taskId);
           if (task) { this.tasks.delete(message.taskId); task.resolve(message); }
         }
+        // Host listeners can synchronously decide whether all work has finished.
+        this.emit('task', message);
       }
     });
     child.stderr.on('data', data => this.log('hyperframes', String(data).slice(0, 4000)));
-    child.on('error', error => this.failAll(error));
+    child.on('error', error => { if (this.child !== child) return; this.child = null; this.root = null; this.failAll(error); this.emit('stopped', { error: error.message }); });
     child.on('exit', (code, signal) => {
-      if (this.child === child) { this.child = null; this.root = null; }
+      if (this.child !== child) return;
+      this.child = null; this.root = null;
       this.failAll(new Error(`HyperFrames 服务已停止 (${code ?? signal})`)); this.emit('stopped', { code, signal });
     });
     return this.request('status', {}, 45000);
