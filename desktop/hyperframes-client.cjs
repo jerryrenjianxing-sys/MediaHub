@@ -86,13 +86,13 @@ class HyperframesClient extends EventEmitter {
     if (action !== 'render') return this.request(action, params, action === 'check' ? 180000 : 60000);
     const taskId = context.taskId || params.taskId;
     if (!taskId) throw new Error('渲染必须带有平台任务 ID');
+    if (context.signal?.aborted) throw Object.assign(new Error('任务已取消'), { name: 'AbortError' });
     const result = this.waitTask(taskId, context);
     this.active.add(taskId);
     result.catch(() => {});
     const cancel = () => { this.request('cancel', { taskId }, 180000).catch(error => this.log('cancel', error.message)); };
     context.signal?.addEventListener('abort', cancel, { once: true });
     try {
-      if (context.signal?.aborted) throw Object.assign(new Error('任务已取消'), { name: 'AbortError' });
       try { await this.request('render', { ...params, taskId }, 60000); }
       catch (error) {
         if (error.code) { this.active.delete(taskId); throw error; }
@@ -101,8 +101,11 @@ class HyperframesClient extends EventEmitter {
         if (['complete', 'completed', 'failed', 'cancelled'].includes(status?.status)) {
           status.status = status.status === 'complete' ? 'completed' : status.status;
           this.active.delete(taskId); this.tasks.get(taskId)?.resolve(status); this.tasks.delete(taskId);
-        } else if (!status || !['queued', 'rendering', 'validating', 'running'].includes(status.status)) throw error;
+        } else if (status && !['queued', 'rendering', 'validating', 'running'].includes(status.status)) { this.active.delete(taskId); throw error; }
+        else if (!status) context.progress?.({ phase: 'unknown', message: '受理结果未知，正在等待真实回执；可以取消任务' });
       }
+      // An abort may have arrived before the sidecar created its task record.
+      if (context.signal?.aborted) await this.request('cancel', { taskId }, 180000);
       const receipt = await result;
       const state = receipt.status || receipt.state;
       if (state === 'cancelled') throw Object.assign(new Error('渲染已取消，进程已停止'), { name: 'AbortError', code: 'CANCELLED' });

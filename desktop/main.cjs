@@ -28,14 +28,15 @@ const userSid = execFileSync(path.join(process.env.SystemRoot, 'System32/whoami.
 if (!userSid) throw new Error('无法确认当前 Windows 用户身份');
 const pipeName = `MediaHub-${crypto.createHash('sha256').update(`${userSid}|${dataRoot.toLowerCase()}`).digest('hex').slice(0, 24)}`;
 const helperPath = app.isPackaged ? path.join(resourceRoot, 'native/mediahub-pipe.exe') : path.join(sourceRoot, 'build/native/mediahub-pipe.exe');
-let manager, window, tray, studio, pipeServer, updates, quitting = false, quitWait = false, ready = false, studioGeneration = 0, pipeReady = false;
+let manager, window, tray, studio, pipeServer, updates, quitting = false, quitWait = false, ready = false, studioGeneration = 0, pipeReady = false, updateInstallScheduled = false;
 const externalTasks = new Map();
+const studioUrls = new Map();
 fs.mkdirSync(path.join(dataRoot, 'logs'), { recursive: true });
 function log(kind, value) { fs.appendFileSync(path.join(dataRoot, 'logs/desktop.log'), `${new Date().toISOString()} ${kind} ${String(value).slice(0, 8000)}\n`); }
 const hf = new HyperframesClient({ helperPath, log });
 
 function snapshot() { return { ...manager.snapshot(), platformUpdates: updates?.snapshot() || { status: 'unavailable', currentVersion: app.getVersion(), error: '开发模式未启用平台升级' }, connection: { ...(manager.snapshot().connection || {}), transport: 'windows-named-pipe', pipe: pipeName, pipeName, endpoint: `\\\\.\\pipe\\${pipeName}`, skillPath: path.join(resourceRoot, 'agent-skill/mediahub'), available: pipeReady, profile: profile ? 'acceptance' : 'production' } }; }
-function changed() { if (window && !window.isDestroyed() && ready) window.webContents.send('mediahub:changed', snapshot()); maybeFinishQuit(); }
+function changed() { if (ready && pipeReady) updates?.markReady(); if (window && !window.isDestroyed() && ready) window.webContents.send('mediahub:changed', snapshot()); maybeFinishQuit(); }
 function busyTasks() { return manager?.snapshot().tasks.filter(t => ['queued', 'running', 'cancelling'].includes(t.state)) || []; }
 function busyOperations() { return manager?.snapshot().operations?.filter(o => ['queued', 'running', 'downloading', 'installing', 'verifying', 'starting'].includes(o.state || o.status)) || []; }
 function hasWork() { return busyTasks().length > 0 || busyOperations().length > 0 || hf.busy; }
@@ -117,6 +118,7 @@ async function invokeHyperframes(action, params, context = {}) {
   if (action === 'render') normalized.source = 'agent';
   if (action === 'import' && params.asset) normalized.assets = [{ assetId: params.asset.id, sourcePath: params.asset.path }];
   const result = await hf.invoke(action, normalized, context);
+  if (action === 'preview') { if (result.studioUrl) studioUrls.set(params.projectId, result.studioUrl); const { studioUrl, ...safeResult } = result; return { ...safeResult, studioAvailable: !!studioUrl }; }
   if (action === 'render') {
     return { ...result, artifact: { path: result.outputPath, name: path.basename(result.outputPath || 'render.mp4'), media: result.media, mediaValidated: result.mediaValidated === true, projectId: params.projectId, toolId: 'hyperframes' } };
   }
@@ -133,10 +135,12 @@ async function call(method, params = {}) {
   if (method.startsWith('platform.updates/')) {
     if (!updates) throw new Error('当前开发运行不支持平台安装更新');
     if (method === 'platform.updates/install') {
+      if (updateInstallScheduled) throw new Error('平台更新已受理，请等待重启');
       if (updates.snapshot().status !== 'downloaded') throw new Error('平台更新尚未下载完成');
-      if (hasWork()) throw new Error('请等待当前任务完成后安装平台更新');
+      if (hasWork() || studio) throw new Error('请关闭视频编辑页并等待当前任务完成后安装平台更新');
+      updateInstallScheduled = true;
       // Return the acceptance receipt before restarting the process and closing its pipe.
-      setTimeout(() => updates.call('install').catch(error => log('update-install', error.message)), 150);
+      setTimeout(() => updates.call('install').catch(error => { updateInstallScheduled = false; log('update-install', error.message); }), 150);
       return { accepted: true, targetVersion: updates.snapshot().availableVersion, status: 'scheduled' };
     }
     return updates.call(method.slice('platform.updates/'.length));
@@ -167,12 +171,17 @@ async function closeStudio() { studioGeneration++; if (studio) { window.contentV
 async function openStudio(projectId, bounds) {
   await closeStudio();
   const generation = studioGeneration;
-  const project = recordById('project', projectId);
-  await hf.start(activeHyperframesRoot());
+  recordById('project', projectId);
+  const receipt = await manager.call('capabilities.invoke', { capabilityId: 'hyperframes.preview', projectId });
+  for (let attempts = 0; ; attempts++) {
+    const task = await manager.call('tasks.get', { taskId: receipt.id });
+    if (task.state === 'completed') break;
+    if (['failed', 'cancelled', 'interrupted'].includes(task.state)) throw new Error(task.error?.message || 'Studio 预览未能启动');
+    if (attempts >= 750) throw new Error('Studio 预览启动超时，请检查任务状态');
+    await new Promise(resolve => setTimeout(resolve, 80));
+  }
   if (generation !== studioGeneration) return { cancelled: true };
-  const result = await hf.request('preview', { projectDir: project.path, projectId });
-  if (generation !== studioGeneration) return { cancelled: true };
-  const target = new URL(result.studioUrl);
+  const target = new URL(studioUrls.get(projectId));
   if (!['localhost', '127.0.0.1'].includes(target.hostname) || target.protocol !== 'http:') throw new Error('Studio 返回了不受信任的地址');
   const studioSession = session.fromPartition(`mediahub-studio-${crypto.randomUUID()}`);
   secureSession(studioSession);
@@ -180,6 +189,8 @@ async function openStudio(projectId, bounds) {
   studio.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   const origin = target.origin;
   studio.webContents.on('will-navigate', (event, url) => { if (new URL(url).origin !== origin) event.preventDefault(); });
+  const allowedOrigins = new Set([origin, new URL((await manager.call('tasks.get', { taskId: receipt.id })).result.previewUrl).origin]);
+  studio.webContents.on('will-frame-navigate', details => { try { if (!allowedOrigins.has(new URL(details.url).origin)) details.preventDefault(); } catch { details.preventDefault(); } });
   window.contentView.addChildView(studio); studio.setBounds(clampBounds(bounds));
   const currentStudio = studio;
   try { await currentStudio.webContents.loadURL(target.href); }
@@ -307,8 +318,9 @@ else {
   app.on('before-quit', event => { if (!quitting) { event.preventDefault(); requestQuit().catch(error => log('quit', error.message)); } });
   app.whenReady().then(async () => {
     const catalog = JSON.parse(fs.readFileSync(path.join(resourceRoot, 'resources/catalog.json'), 'utf8'));
-    manager = createManager({ dataRoot, resourceRoot, catalog, version: app.getVersion(), acceptance: !!profile, allowExternalScan: !!profile?.allowExternalScan, workspaceRoot: profile?.workspaceRoot, pipeName, agentClientPath: helperPath, skillPath: path.join(resourceRoot, 'agent-skill/mediahub'), catalogUrl: 'https://raw.githubusercontent.com/jerryrenjianxing-sys/MediaHub/distribution/catalog/catalog.signed.json', catalogPublicKey: fs.readFileSync(path.join(resourceRoot, 'resources/catalog-public.pem'), 'utf8'), onOpenExternalTool: openExternalTool, onInstallExternal: installExternalTool, onInvokeHyperframes: invokeHyperframes, onComponentHealth: componentHealth, onComponentStop: async () => { await closeStudio(); await hf.stop({ idleOnly: true }); }, onComponentBusy: () => hf.busy, onVerifyExternal: (id, executable) => verifyExternal(catalog.tools.find(t => t.id === id), executable), onScanExternal: tool => scanExternal(tool), onArchiveSkill: archiveSkill, onCancelExternalTask: async task => { const response = await hf.request('cancel', { taskId: task.externalId }, 180000); return response; } });
+    manager = createManager({ dataRoot, resourceRoot, programRoot: app.isPackaged ? path.dirname(app.getPath('exe')) : undefined, catalog, version: app.getVersion(), acceptance: !!profile, allowExternalScan: !!profile?.allowExternalScan, workspaceRoot: profile?.workspaceRoot, pipeName, agentClientPath: helperPath, skillPath: path.join(resourceRoot, 'agent-skill/mediahub'), catalogUrl: 'https://raw.githubusercontent.com/jerryrenjianxing-sys/MediaHub/distribution/catalog/catalog.signed.json', catalogPublicKey: fs.readFileSync(path.join(resourceRoot, 'resources/catalog-public.pem'), 'utf8'), onOpenExternalTool: openExternalTool, onInstallExternal: installExternalTool, onInvokeHyperframes: invokeHyperframes, onComponentHealth: componentHealth, onComponentStop: async () => { await closeStudio(); await hf.stop({ idleOnly: true }); }, onComponentBusy: () => hf.busy || !!studio, onVerifyExternal: (id, executable) => verifyExternal(catalog.tools.find(t => t.id === id), executable), onScanExternal: tool => scanExternal(tool), onArchiveSkill: archiveSkill, onCancelExternalTask: async task => { const response = await hf.request('cancel', { taskId: task.externalId }, 180000); return response; } });
     await manager.ready; manager.on('changed', changed);
+    hf.on('stopped', () => { studioUrls.clear(); manager.componentStopped('hyperframes'); });
     hf.on('task', async event => {
       if (event.source !== 'studio') return;
       let taskId = externalTasks.get(event.taskId);
@@ -323,8 +335,10 @@ else {
     startPipe();
     if (app.isPackaged) {
       const { autoUpdater } = require('electron-updater');
+      // Keep updater downloads under the same profile root, including acceptance runs.
+      Object.defineProperty(autoUpdater.app, 'baseCachePath', { value: path.join(dataRoot, 'updates') });
       if (profile) autoUpdater.installDirectory = path.dirname(app.getPath('exe'));
-      updates = new UpdateController({ updater: autoUpdater, version: app.getVersion(), installOptions: { silent: !!profile, forceRunAfter: !profile }, beforeInstall: async () => {
+      updates = new UpdateController({ updater: autoUpdater, dataRoot, version: app.getVersion(), installOptions: { silent: !!profile, forceRunAfter: !profile }, beforeInstall: async () => {
         if (hasWork()) { await dialog.showMessageBox(window, { type: 'info', message: '请等待当前任务完成后安装平台更新。' }); return false; }
         quitting = true; await closeStudio(); await hf.stop({ idleOnly: true }); await manager.close(); pipeServer?.kill(); return true;
       } });

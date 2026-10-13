@@ -32,7 +32,7 @@ function createManager(options = {}) {
   const componentLocks = new Set();
   let closed = false; let db;
   let catalog = validateCatalog(options.catalog || readJson(path.join(options.resourceRoot || dataRoot, 'catalog.json'), { schemaVersion: 1, tools: DEFAULT_TOOLS }));
-  let settings = { theme: 'system', workspacePath: options.acceptance ? path.join(dataRoot, 'acceptance-workspace') : path.join(os.homedir(), 'Documents', 'MediaHubWorkspace') };
+  let settings = { theme: 'system', workspacePath: options.acceptance ? path.join(path.dirname(dataRoot), path.basename(dataRoot) + '-workspace') : path.join(os.homedir(), 'Documents', 'MediaHubWorkspace') };
   let workspace; let projects = []; let assets = []; let artifacts = [];
   const connection = { protocol: 1, transport: 'windows-named-pipe', pipe: options.pipeName || null, clientPath: options.agentClientPath || options.helperPath || null, profile: options.acceptance ? 'acceptance' : 'default' };
   let connectionFile;
@@ -58,7 +58,7 @@ function createManager(options = {}) {
   }
   function toolView(tool) {
     const installed = records.tools[tool.id] || {};
-    return { id: tool.id, name: tool.name, description: tool.description || '', kind: tool.kind, management: tool.kind === 'external' ? 'original' : 'platform', status: installed.status || 'not-installed', version: installed.version || null, installedVersion: installed.version || null, availableVersion: tool.version || null, installPath: installed.installPath || null, dataPaths: installed.dataPaths || [], entryUrl: installed.entryUrl || tool.links?.home || null, downloadBytes: tool.package?.bytes || tool.install?.bytes || null, canInstall: !!(tool.package || tool.install || tool.links?.download), canUpdate: !!tool.version && installed.version !== tool.version, error: installed.error || null, originalManaged: tool.kind === 'external' };
+    return { id: tool.id, name: tool.name, description: tool.description || '', kind: tool.kind, management: tool.kind === 'external' ? 'original' : 'platform', status: installed.status || 'not-installed', version: installed.version || null, installedVersion: installed.version || null, availableVersion: tool.version || null, installPath: installed.installPath || null, dataPaths: installed.dataPaths || [], services: installed.services || [], entryUrl: installed.entryUrl || tool.links?.home || null, downloadBytes: tool.package?.bytes || tool.install?.bytes || null, canInstall: !!(tool.package || tool.install || tool.links?.download), canUpdate: !!tool.version && installed.version !== tool.version, error: installed.error || null, originalManaged: tool.kind === 'external' };
   }
   function snapshot() {
     return clone({ version: options.version || '0.1.0-preview.1', workspace, tools: catalog.tools.map(toolView), projects, assets, artifacts, tasks: Object.values(records.tasks).sort((a, b) => b.createdAt.localeCompare(a.createdAt)), operations: Object.values(records.operations).sort((a, b) => b.createdAt.localeCompare(a.createdAt)), connection: { ...connection, connectionFile }, settings });
@@ -91,7 +91,7 @@ function createManager(options = {}) {
   function setWorkspace(target) {
     if (typeof target !== 'string' || !path.isAbsolute(target)) throw fault('INVALID_PATH', '请选择绝对工作空间路径');
     target = path.resolve(target);
-    if (within(componentsRoot, target) || within(cacheRoot, target) || within(target, componentsRoot) || within(target, cacheRoot)) throw fault('INVALID_PATH', '工作空间必须与程序及下载目录分开');
+    if (within(dataRoot, target) || within(target, dataRoot) || (options.programRoot && (within(options.programRoot, target) || within(target, options.programRoot)))) throw fault('INVALID_PATH', '工作空间必须与程序及平台数据目录分开');
     if (Object.values(records.tasks).some(t => !FINISHED.has(t.state))) throw fault('BUSY', '任务执行期间不能切换工作空间');
     ensureDir(target); nonSymlink(target);
     const marker = path.join(target, 'workspace.json');
@@ -210,14 +210,18 @@ function createManager(options = {}) {
   function capabilities() {
     return ['create', 'preview', 'lint', 'check', 'render', 'import', 'stop'].map(action => ({ id: `hyperframes.${action}`, toolId: 'hyperframes', action, name: { create: '创建视频工程', preview: '打开预览', lint: '静态检查', check: '检查工程', render: '导出 MP4', import: '导入素材', stop: '停止预览' }[action], available: ['installed', 'running'].includes(records.tools.hyperframes?.status) && typeof options.onInvokeHyperframes === 'function' && (!options.hyperframesActions || options.hyperframesActions.includes(action)), requiresProject: true }));
   }
-  function registerArtifact(params) {
+  function registerArtifact(params, trustedRender = false) {
     const project = requireProject(params.projectId);
     if (!params.path || !path.isAbsolute(params.path) || !within(project.path, params.path)) throw fault('INVALID_PATH', '成果必须保存在对应项目内');
     const actualPath = nonSymlink(params.path);
     if (!fs.statSync(actualPath).isFile() || !within(fs.realpathSync(project.path), actualPath)) throw fault('INVALID_PATH', '成果不是有效的项目文件');
+    if (params.toolId === 'hyperframes' && !trustedRender) {
+      const task = records.tasks[params.taskId];
+      if (!task || task.state !== 'completed' || task.projectId !== project.id || task.capabilityId !== 'hyperframes.render' || task.result?.artifact?.path !== actualPath || task.result?.artifact?.mediaValidated !== true) throw fault('MEDIA_NOT_VALIDATED', 'HyperFrames 成片必须来自通过媒体检查的成功任务回执');
+    }
     const existing = artifacts.find(a => a.path === actualPath && a.projectId === project.id);
     if (existing) return existing;
-    const artifact = { id: id('artifact'), name: params.name || path.basename(actualPath), path: actualPath, projectId: project.id, toolId: params.toolId || null, taskId: params.taskId || null, media: params.media || null, createdAt: now() };
+    const artifact = { id: id('artifact'), name: params.name || path.basename(actualPath), path: actualPath, projectId: project.id, toolId: params.toolId || null, taskId: params.taskId || null, media: params.media || null, mediaValidated: trustedRender && params.mediaValidated === true, createdAt: now() };
     artifacts.push(artifact); atomicJson(path.join(project.path, 'artifacts.json'), artifacts.filter(a => a.projectId === project.id)); indexWorkspace(); changed(); return artifact;
   }
   async function call(method, params = {}) {
@@ -235,7 +239,7 @@ function createManager(options = {}) {
         let verified = null;
         if (options.onVerifyExternal) verified = await options.onVerifyExternal(tool.id, installPath);
         else throw fault('IDENTITY_UNVERIFIED', '无法确认可执行文件属于该工具');
-        save('tools', { id: tool.id, status: 'installed', installPath, version: verified?.version || null, dataPaths: verified?.dataPaths || [], updatedAt: now() }); changed(); return toolView(tool);
+        save('tools', { id: tool.id, status: 'installed', installPath, version: verified?.version || null, dataPaths: verified?.dataPaths || [], services: verified?.services || [], updatedAt: now() }); changed(); return toolView(tool);
       }
       case 'tools.install': {
         const tool = requireTool(params.toolId || params.id);
@@ -246,7 +250,7 @@ function createManager(options = {}) {
           const result = await options.onInstallExternal(tool, context);
           if (result?.installPath) {
             if (!fs.existsSync(result.installPath)) throw fault('INSTALL_NOT_FOUND', '安装程序结束后未找到工具');
-            save('tools', { id: tool.id, status: 'installed', installPath: result.installPath, version: result.version || null, dataPaths: result.dataPaths || [], updatedAt: now() }); changed();
+            save('tools', { id: tool.id, status: 'installed', installPath: result.installPath, version: result.version || null, dataPaths: result.dataPaths || [], services: result.services || [], updatedAt: now() }); changed();
           }
           return result || { managedBy: 'original', message: '已打开原软件安装入口，请完成安装后重新扫描' };
         });
@@ -299,7 +303,8 @@ function createManager(options = {}) {
         if (!stat.isFile()) throw fault('INVALID_PATH', '请选择素材文件');
         const asset = { id: id('asset'), name: params.name || path.basename(sourcePath), sourcePath, bytes: stat.size, sha256: await sha256(sourcePath), projectId: params.projectId || null, createdAt: now() };
         if (asset.projectId) requireProject(asset.projectId);
-        const target = path.join(workspace.path, 'assets', asset.id, safeName(path.basename(sourcePath))); ensureDir(path.dirname(target)); fs.copyFileSync(sourcePath, target, fs.constants.COPYFILE_EXCL); asset.path = target;
+        const disk = fs.statfsSync(workspace.path); if (Number(disk.bavail) * Number(disk.bsize) < stat.size) throw fault('DISK_SPACE', '工作空间可用空间不足以复制素材');
+        const target = path.join(workspace.path, 'assets', asset.id, safeName(path.basename(sourcePath))); ensureDir(path.dirname(target)); await fs.promises.copyFile(sourcePath, target, fs.constants.COPYFILE_EXCL); asset.path = target;
         assets.push(asset); atomicJson(path.join(workspace.path, 'assets', 'assets.json'), assets); indexWorkspace(); changed(); return asset;
       }
       case 'artifacts.list': return clone(artifacts.filter(a => !params.projectId || a.projectId === params.projectId));
@@ -335,7 +340,7 @@ function createManager(options = {}) {
           if (cap.action === 'stop') save('tools', { ...records.tools.hyperframes, status: 'installed', entryUrl: null });
           if (cap.action === 'render') {
             if (!result?.artifact?.mediaValidated) throw fault('MEDIA_NOT_VALIDATED', '渲染结果尚未通过媒体检查');
-            result.artifact = registerArtifact({ ...result.artifact, projectId: project.id, toolId: 'hyperframes', taskId: context.taskId });
+            result.artifact = registerArtifact({ ...result.artifact, projectId: project.id, toolId: 'hyperframes', taskId: context.taskId }, true);
           }
           return result;
         });
@@ -400,10 +405,11 @@ function createManager(options = {}) {
     if (patch.state && !['queued', 'running', 'cancelling', 'completed', 'failed', 'cancelled', 'interrupted'].includes(patch.state)) throw fault('INVALID_STATE', '任务状态无效');
     if (patch.state === 'completed' && current.capabilityId === 'hyperframes.render') {
       if (!patch.result?.artifact?.mediaValidated) throw fault('MEDIA_NOT_VALIDATED', '渲染结果尚未通过媒体检查');
-      patch.result.artifact = registerArtifact({ ...patch.result.artifact, projectId: current.projectId, toolId: current.toolId, taskId });
+      patch.result.artifact = registerArtifact({ ...patch.result.artifact, projectId: current.projectId, toolId: current.toolId, taskId }, true);
     }
     return clone(transition('tasks', current, { state: patch.state || current.state, progress: patch.progress || current.progress, result: patch.result || current.result, error: patch.error || current.error }));
   }
-  return { ready, snapshot, call, on: emitter.on.bind(emitter), once: emitter.once.bind(emitter), off: emitter.off.bind(emitter), close, beginExternalTask, updateExternalTask, get busy() { return controllers.size > 0 || Object.values(records.tasks).some(t => !FINISHED.has(t.state)); } };
+  function componentStopped(toolId) { const value = records.tools[toolId]; if (value?.status === 'running') { save('tools', { ...value, status: 'installed', entryUrl: null, updatedAt: now() }); changed(); } }
+  return { ready, snapshot, call, on: emitter.on.bind(emitter), once: emitter.once.bind(emitter), off: emitter.off.bind(emitter), close, beginExternalTask, updateExternalTask, componentStopped, get busy() { return controllers.size > 0 || Object.values(records.tasks).some(t => !FINISHED.has(t.state)); } };
 }
 module.exports = { createManager, DEFAULT_TOOLS };

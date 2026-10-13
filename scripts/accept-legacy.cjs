@@ -14,12 +14,26 @@ function assertHostedRunner(env = process.env, platform = process.platform) {
     throw new Error('This acceptance may run only in a disposable GitHub-hosted Windows runner; personal and self-hosted machines are refused.');
   }
 }
-function installerArguments(toolId, destination, logPath) {
+function installerArguments(toolId, destination, logPath, profilePath) {
   if (toolId === 'media-deep-researcher') return { args: ['--silent', '--installto', destination, '--log', logPath], windowsVerbatimArguments: false };
   // NSIS consumes the remaining command-line tail as /D. Quotes around it change that tail.
-  return { args: ['/S', `/D=${destination}`], windowsVerbatimArguments: true };
+  const args = ['/S'];
+  // MediaFlow's original installer resolves this profile before extraction, and its
+  // install_root is authoritative. NSIS GetOptions strips the value's quotes.
+  if (toolId === 'mediaflow') {
+    if (!profilePath || !path.isAbsolute(profilePath) || /["\r\n]/.test(profilePath)) throw new Error('MediaFlow acceptance requires an absolute isolated profile path');
+    args.push(`/INSTANCEPROFILE="${profilePath}"`);
+  }
+  args.push(`/D=${destination}`);
+  return { args, windowsVerbatimArguments: true };
 }
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+function redactLog(value) {
+  return String(value)
+    .replace(/((?:authorization|password|passwd|secret|(?:access[_-]?|refresh[_-]?|agent[_-]?|api[_-]?)?token|api[_-]?key|cookie)\s*[=:]\s*)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s,;}\r\n]+)/gi, '$1[REDACTED]')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+/gi, 'Bearer [REDACTED]')
+    .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)/g, '[REDACTED]');
+}
 
 async function main() {
   assertHostedRunner();
@@ -32,14 +46,79 @@ async function main() {
   const evidenceRoot = ensureDir(path.join(acceptanceRoot, 'evidence'));
   const logsRoot = ensureDir(path.join(acceptanceRoot, 'logs'));
   const preservedRoot = ensureDir(path.join(acceptanceRoot, '留存资料'));
+  const originalProfilesRoot = ensureDir(path.join(acceptanceRoot, 'original-profiles'));
+  const mediaFlowProfilePath = path.join(originalProfilesRoot, 'mediaflow-instance.json');
+  atomicJson(mediaFlowProfilePath, {
+    schema: 1, id: 'mediahub_acceptance', acceptance: true,
+    install_root: path.join(applicationsRoot, 'mediaflow'),
+    data_root: path.join(originalProfilesRoot, 'mediaflow', 'data'),
+    ui_port: 30351, api_port: 48351, stream_port: 48352,
+    task_name: 'MediaHub CI MediaFlow Acceptance', shortcut_name: 'MediaFlow MediaHub CI Acceptance',
+    registry_key: 'Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MediaFlow.Acceptance.MediaHubCI'
+  });
+  // Original programs support these documented isolated data/discovery locations.
+  // All child processes and the read-only identity verifier use the same values.
+  process.env.MEDIAWORKBENCH_DATA_DIR = path.join(originalProfilesRoot, 'media-deep-researcher', 'data');
+  process.env.MEDIAWORKBENCH_INSTANCE = path.join(originalProfilesRoot, 'media-deep-researcher', 'instance.json');
+  process.env.EASEL_DESKTOP_DATA = path.join(originalProfilesRoot, 'mediasail');
   const catalog = JSON.parse(fs.readFileSync(path.join(repoRoot, 'resources', 'catalog.json'), 'utf8'));
   const externalTools = catalog.tools.filter(tool => tool.kind === 'external');
   assert.equal(externalTools.length, 3, 'Expected the three approved original tools');
-  const report = { schema: 1, startedAt: new Date().toISOString(), completedAt: null, passed: false, profile: 'disposable-github-hosted-windows', run: { id: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, sha: process.env.GITHUB_SHA }, isolationRoot: acceptanceRoot, tests: [], tools: [], limits: ['Installation, identity, first opening and original-management handoff only; no business workflow, account login, update installation or actual uninstall is performed.'] };
+  const report = { schema: 2, startedAt: new Date().toISOString(), completedAt: null, passed: false, profile: 'disposable-github-hosted-windows', run: { id: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, sha: process.env.GITHUB_SHA }, isolationRoot: acceptanceRoot, tests: [], tools: [], limits: ['Installation, identity, first opening and original-management handoff only; no business workflow, account login, update installation or actual uninstall is performed.'] };
   let manager;
   const startedTools = new Set();
   const saveReport = () => atomicJson(path.join(acceptanceRoot, 'report.json'), report);
   const resultFor = toolId => report.tools.find(item => item.id === toolId);
+
+  async function collectDiagnostics(tool, destination, logPath) {
+    const result = resultFor(tool.id);
+    const diagnostics = { collectedAt: new Date().toISOString(), directoryExists: fs.existsSync(destination), observedInstallation: null, candidateDirectories: [], installerLogs: [], transactions: [] };
+    try { diagnostics.observedInstallation = await findInstalled(tool, destination); } catch (error) { diagnostics.identityError = error.message; }
+    const parent = path.dirname(destination);
+    if (fs.existsSync(parent)) for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.isSymbolicLink() || !entry.name.startsWith(path.basename(destination) + '.candidate-')) continue;
+      const candidate = path.join(parent, entry.name);
+      if (!within(applicationsRoot, candidate)) continue;
+      const identity = await findInstalled(tool, candidate);
+      diagnostics.candidateDirectories.push({ path: candidate, identity });
+    }
+    // Never publish connection files or arbitrary account logs. These known
+    // original installer logs are bounded and credential-like values are redacted.
+    const knownLogs = [logPath, path.join(process.env.LOCALAPPDATA, 'Velopack', 'velopack.log'), path.join(process.env.LOCALAPPDATA, 'SquirrelTemp', 'SquirrelSetup.log')];
+    for (const source of knownLogs) {
+      if (!fs.existsSync(source) || !fs.statSync(source).isFile()) continue;
+      const bytes = fs.statSync(source).size;
+      const descriptor = fs.openSync(source, 'r');
+      const content = Buffer.alloc(Math.min(bytes, 256 * 1024));
+      try { fs.readSync(descriptor, content, 0, content.length, Math.max(0, bytes - content.length)); } finally { fs.closeSync(descriptor); }
+      const output = path.join(logsRoot, `${tool.id}-${path.basename(source)}.redacted.log`);
+      fs.writeFileSync(output, redactLog(content.toString('utf8')));
+      diagnostics.installerLogs.push({ source, saved: output, sourceBytes: bytes, truncated: bytes > content.length });
+    }
+    if (tool.id === 'mediaflow') {
+      const backups = path.join(originalProfilesRoot, 'mediaflow', 'installer-backups');
+      if (fs.existsSync(backups)) for (const entry of fs.readdirSync(backups, { withFileTypes: true }).slice(-10)) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        const file = path.join(backups, entry.name, 'transaction.json');
+        if (!fs.existsSync(file) || fs.statSync(file).size > 1024 * 1024) continue;
+        try {
+          const transaction = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''));
+          const fields = ['phase', 'committed', 'mutation_started', 'program_changed', 'install_root', 'candidate_root', 'backup_root', 'task_name', 'profile_path', 'legacy', 'failure_action'];
+          const item = { source: file };
+          for (const key of fields) if (Object.hasOwn(transaction, key)) item[key] = transaction[key];
+          if (transaction.last_error) item.last_error = redactLog(transaction.last_error);
+          diagnostics.transactions.push(item);
+        } catch (error) { diagnostics.transactions.push({ source: file, error: error.message }); }
+      }
+      try {
+        diagnostics.scheduledTask = await powershellJson("$task=Get-ScheduledTask -TaskName $inputRecord.name -ErrorAction SilentlyContinue;if($task){@{name=$task.TaskName;state=[string]$task.State;principal=@{logonType=[string]$task.Principal.LogonType;runLevel=[string]$task.Principal.RunLevel};actions=@($task.Actions|ForEach-Object{@{execute=$_.Execute;arguments=$_.Arguments}})}|ConvertTo-Json -Depth 5 -Compress}else{'null'}", { name: 'MediaHub CI MediaFlow Acceptance' });
+      } catch (error) { diagnostics.scheduledTaskError = error.message; }
+    }
+    result.diagnostics = diagnostics;
+    atomicJson(path.join(evidenceRoot, `${tool.id}-installer-diagnostics.json`), diagnostics); saveReport();
+    if (fs.existsSync(logPath)) fs.writeFileSync(logPath, redactLog(fs.readFileSync(logPath, 'utf8').slice(-256 * 1024)));
+    return diagnostics;
+  }
 
   async function processEvidence(installPath) {
     return powershellJson("$items=@();foreach($p in Get-CimInstance Win32_Process -ErrorAction SilentlyContinue){if($p.ExecutablePath -and [string]::Equals($p.ExecutablePath,$inputRecord.path,[StringComparison]::OrdinalIgnoreCase)){try{$live=Get-Process -Id $p.ProcessId -ErrorAction Stop;$items+=@{pid=$p.ProcessId;parentPid=$p.ParentProcessId;executable=$p.ExecutablePath;windowHandle=$live.MainWindowHandle.ToInt64();windowTitle=$live.MainWindowTitle;startedAt=$live.StartTime.ToUniversalTime().ToString('o')}}catch{}}};ConvertTo-Json -InputObject @($items) -Compress", { path: installPath });
@@ -47,7 +126,8 @@ async function main() {
   async function observeFirstOpen(tool, installed, action) {
     assert.ok(within(applicationsRoot, installed.installPath), 'Only the isolated original installation may open');
     const result = resultFor(tool.id);
-    const child = spawn(installed.installPath, [], { cwd: path.dirname(installed.installPath), windowsHide: true, stdio: 'ignore', env: { ...process.env, DO_NOT_TRACK: '1' } });
+    const launchArgs = tool.id === 'mediaflow' ? [`--instance-profile=${mediaFlowProfilePath}`] : [];
+    const child = spawn(installed.installPath, launchArgs, { cwd: path.dirname(installed.installPath), windowsHide: true, stdio: 'ignore', env: { ...process.env, DO_NOT_TRACK: '1' } });
     child.once('error', error => { result.launchError = error.message; }); child.unref(); startedTools.add(tool.id);
     const deadline = Date.now() + 120000;
     let observed = [];
@@ -97,20 +177,25 @@ async function main() {
     result.download = { url: tool.install.url, expectedSha256: tool.install.sha256, actualSha256: actualChecksum, bytes: fs.statSync(installer).size, elapsedMs: Date.now() - begin };
     const destination = path.join(applicationsRoot, tool.id); result.installDirectory = destination;
     const logPath = path.join(logsRoot, `${tool.id}-installer.log`);
-    const launch = installerArguments(tool.id, destination, logPath);
+    const launch = installerArguments(tool.id, destination, logPath, tool.id === 'mediaflow' ? mediaFlowProfilePath : undefined);
     result.installer = { arguments: launch.args, windowsVerbatimArguments: launch.windowsVerbatimArguments, startedAt: new Date().toISOString() }; saveReport();
     context.progress({ phase: 'installing', percent: 0, message: '原安装器在隔离目录执行' });
     const startedAt = Date.now();
     const exitCode = await new Promise((resolve, reject) => {
       const child = spawn(installer, launch.args, { windowsHide: true, windowsVerbatimArguments: launch.windowsVerbatimArguments, stdio: ['ignore', 'pipe', 'pipe'] });
-      const stream = fs.createWriteStream(path.join(logsRoot, `${tool.id}-installer-output.log`));
-      child.stdout.pipe(stream, { end: false }); child.stderr.pipe(stream, { end: false });
-      const timer = setTimeout(() => { child.kill(); reject(new Error(`${tool.name}: installer exceeded 25 minutes`)); }, 25 * 60 * 1000);
-      child.once('error', error => { clearTimeout(timer); stream.end(); reject(error); });
-      child.once('exit', code => { clearTimeout(timer); stream.end(); resolve(code); });
+      let output = '';
+      const collect = chunk => { output = (output + chunk.toString('utf8')).slice(-256 * 1024); };
+      child.stdout.on('data', collect); child.stderr.on('data', collect);
+      const finishLog = () => fs.writeFileSync(path.join(logsRoot, `${tool.id}-installer-output.log`), redactLog(output));
+      const timer = setTimeout(() => { child.kill(); finishLog(); reject(new Error(`${tool.name}: installer exceeded 25 minutes`)); }, 25 * 60 * 1000);
+      child.once('error', error => { clearTimeout(timer); finishLog(); reject(error); });
+      child.once('exit', code => { clearTimeout(timer); finishLog(); resolve(code); });
     });
     result.installer.exitCode = exitCode; result.installer.elapsedMs = Date.now() - startedAt; saveReport();
-    assert.equal(exitCode, 0, `${tool.name}: original installer returned ${exitCode}`);
+    const diagnostics = await collectDiagnostics(tool, destination, logPath);
+    // A nonzero original installer receipt remains a failure even if extraction
+    // produced a valid PE. That identity is retained solely as diagnosis.
+    assert.equal(exitCode, 0, `${tool.name}: original installer returned ${exitCode}${diagnostics.transactions.find(item => item.last_error)?.last_error ? ': ' + diagnostics.transactions.find(item => item.last_error).last_error : ''}`);
     let actual;
     for (let attempt = 0; attempt < 120; attempt++) { actual = await findInstalled(tool, destination); if (actual) break; await pause(1500); }
     assert.ok(actual, `${tool.name}: no verified executable was found in the requested isolated directory`);
@@ -132,11 +217,14 @@ async function main() {
       report.tools.push({ id: tool.id, name: tool.name, passed: false, candidateErrors: [], entries: [], cleanRunnerNoExistingInstall: true });
     }
     report.tests.push('Clean runner has no recognized original installation'); saveReport();
+    report.host = await powershellJson("@{identity=[Security.Principal.WindowsIdentity]::GetCurrent().Name;userInteractive=[Environment]::UserInteractive;sessionId=(Get-Process -Id $PID).SessionId;taskSchedulerStatus=[string](Get-Service -Name Schedule).Status;desktop=[Environment]::GetFolderPath('Desktop');programs=[Environment]::GetFolderPath('Programs')}|ConvertTo-Json -Compress", {});
     manager = createManager({ dataRoot: path.join(acceptanceRoot, 'platform-profile'), workspacePath: path.join(acceptanceRoot, '共享工作空间 中文 空格'), acceptance: true, catalog, onVerifyExternal: (toolId, executable) => verifyExternal(externalTools.find(tool => tool.id === toolId), executable), onInstallExternal: installOriginal, onOpenExternalTool: (tool, installed, intent) => observeFirstOpen(tool, installed, intent?.action || 'open') });
     await manager.ready;
     assert.ok(manager.snapshot().tools.every(tool => tool.status === 'not-installed'));
     for (const tool of externalTools) {
       const result = resultFor(tool.id); console.log(`Begin original installation: ${tool.name}`);
+      try {
+      result.phase = 'installation';
       const operation = await manager.call('tools.install', { toolId: tool.id }); result.platformInstallOperationId = operation.id; saveReport();
       let completed;
       const deadline = Date.now() + 40 * 60 * 1000;
@@ -148,18 +236,23 @@ async function main() {
       assert.ok(completed, `${tool.name}: management operation did not finish`);
       result.platformInstall = completed; saveReport();
       assert.equal(completed.state, 'completed', completed.error?.message || `${tool.name}: install operation failed`);
+      result.phase = 'identity-and-import';
       const installed = await manager.call('tools.import', { toolId: tool.id, path: result.identity.installPath });
       assert.equal(installed.management, 'original'); assert.equal(installed.installedVersion, result.actualVersion);
       result.importedRecord = installed;
       const preservedDirectory = ensureDir(path.join(preservedRoot, tool.id));
+      result.phase = 'first-opening';
       const firstOpen = await manager.call('tools.open', { toolId: tool.id }); assert.equal(firstOpen.managedBy, 'original');
+      const refreshed = await manager.call('tools.import', { toolId: tool.id, path: result.identity.installPath });
+      result.afterFirstOpenRecord = refreshed;
       // Empty account fixtures are created only after the real first launch, in this disposable user's declared tool-data directory.
-      const declaredDataDirectory = installed.dataPaths[0];
+      const declaredDataDirectory = refreshed.dataPaths[0];
       assert.ok(declaredDataDirectory && path.isAbsolute(declaredDataDirectory), 'Original tool must declare its data location');
       ensureDir(declaredDataDirectory);
       const markerValue = crypto.randomUUID();
       const markers = [path.join(preservedDirectory, '原软件资料保留.fixture'), path.join(declaredDataDirectory, `.mediahub-acceptance-${markerValue}.keep`)];
       for (const marker of markers) fs.writeFileSync(marker, markerValue, { flag: 'wx' });
+      result.phase = 'original-management-entries-and-preservation';
       for (const action of ['updateEntry', 'uninstallEntry']) {
         const response = await manager.call(`tools.${action}`, { toolId: tool.id });
         assert.equal(response.managedBy, 'original');
@@ -168,9 +261,21 @@ async function main() {
         assert.equal((await manager.call('tools.status', { toolId: tool.id })).status, 'installed');
       }
       result.preservation = { markerPaths: markers, declaredToolDataPath: declaredDataDirectory, fixture: 'Fresh empty-account sentinel, not a production account or database', sentinelSha256: crypto.createHash('sha256').update(markerValue).digest('hex'), afterManagementEntries: 'unchanged', programStillPresent: true, actualUninstallExecuted: false };
-      result.passed = true; report.tests.push(`${tool.name}: verified download, actual install, actual identity, import, observed original window, update/uninstall handoff and retained data`); saveReport();
+      result.passed = true; result.phase = 'completed'; report.tests.push(`${tool.name}: verified download, actual install, actual identity, import, observed original window, update/uninstall handoff and retained data`); saveReport();
+      } catch (error) {
+        result.failure = { code: error.code || 'LEGACY_TOOL_ACCEPTANCE_FAILED', message: redactLog(error.message), stack: redactLog(error.stack) };
+        if (result.installDirectory && !result.diagnostics) {
+          try { await collectDiagnostics(tool, result.installDirectory, path.join(logsRoot, `${tool.id}-installer.log`)); } catch (diagnosticError) { result.diagnosticsError = diagnosticError.message; }
+        }
+        console.error(`${tool.name}: ${result.phase} failed: ${result.failure.message}`);
+        saveReport();
+      }
     }
     report.passed = report.tools.every(result => result.passed); report.platformSnapshot = manager.snapshot();
+    if (!report.passed) {
+      report.failure = { code: 'LEGACY_ACCEPTANCE_FAILED', message: report.tools.filter(result => !result.passed).map(result => `${result.name}: ${result.failure?.message || 'Not completed'}`).join('\n') };
+      process.exitCode = 1;
+    }
   } catch (error) {
     report.failure = { code: error.code || 'LEGACY_ACCEPTANCE_FAILED', message: error.message, stack: error.stack };
     process.exitCode = 1;
