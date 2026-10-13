@@ -8,7 +8,7 @@ import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { streamSSE } from 'hono/streaming';
 import { createStudioApi, getMimeType } from '@hyperframes/studio-server';
-import { bundleToSingleHtml } from '@hyperframes/core/compiler';
+import { bundleToSingleHtml, parseHTMLContent } from '@hyperframes/core/compiler';
 import { lintProject, lintHyperframeHtml } from '@hyperframes/lint';
 import { componentRoot, versions, applyRuntimeEnvironment, assertRuntime } from './runtime.mjs';
 import { createTemplate, design } from './template.mjs';
@@ -41,11 +41,12 @@ export class HyperframesAdapter {
     if (typeof projectDir!=='string' || !path.isAbsolute(projectDir)) throw error('INVALID_PROJECT','An absolute projectDir is required');
     const dir=await fsp.realpath(projectDir); const file=await safeFile(dir,'mediahub-hyperframes.json');
     const metadata=await jsonRead(file);
-    if (metadata.tool!=='hyperframes' || !/^[a-zA-Z0-9-]{1,100}$/.test(metadata.id)) throw error('INVALID_PROJECT','This is not a MediaHub HyperFrames project');
+    if(fs.existsSync(path.join(dir,'index.html')))try{const document=parseHTMLContent(await fsp.readFile(await safeFile(dir,'index.html'),'utf8'));const root=document.querySelector('[data-composition-id]');const duration=Number(root?.getAttribute('data-duration') || document.documentElement.getAttribute('data-composition-duration'));if(Number.isFinite(duration)&&duration>0)metadata.duration=duration;}catch{}
+    if (metadata.tool!=='hyperframes' || !/^[a-zA-Z0-9_-]{1,100}$/.test(metadata.id)) throw error('INVALID_PROJECT','This is not a MediaHub HyperFrames project');
     const platformFile=path.join(dir,'project.json'); const platformMetadata=fs.existsSync(platformFile)?await jsonRead(await safeFile(dir,'project.json')):null;
     const platformId=platformMetadata?.id || metadata.platformProjectId || metadata.id;
-    if(!/^[a-zA-Z0-9-]{1,100}$/.test(platformId))throw error('INVALID_PROJECT','Invalid platform project identity');
-    const project={id:platformId,upstreamProjectId:metadata.id,dir,title:platformMetadata?.name || metadata.title,metadata}; this.projects.set(project.id,project);
+    if(!/^[a-zA-Z0-9_-]{1,100}$/.test(platformId))throw error('INVALID_PROJECT','Invalid platform project identity');
+    const project={id:platformId,upstreamProjectId:metadata.id,dir,title:platformMetadata?.name || metadata.title,metadata};if(platformId!==metadata.id)this.projects.delete(metadata.id); this.projects.set(project.id,project);
     const recordDir=path.join(dir,'.mediahub','tasks');
     if (fs.existsSync(recordDir)) for (const name of await fsp.readdir(recordDir)) {
       if (!name.endsWith('.json')) continue;
@@ -65,7 +66,7 @@ export class HyperframesAdapter {
     const dir=path.resolve(projectDir);
     const platformMetadata=fs.existsSync(path.join(dir,'project.json'))?await jsonRead(path.join(dir,'project.json')):null;
     const id=projectId || platformMetadata?.id || crypto.randomUUID();
-    if(!/^[a-zA-Z0-9-]{1,100}$/.test(id) || (platformMetadata?.id && platformMetadata.id!==id))throw error('INVALID_PROJECT','HyperFrames must use the platform project identity');
+    if(!/^[a-zA-Z0-9_-]{1,100}$/.test(id) || (platformMetadata?.id && platformMetadata.id!==id))throw error('INVALID_PROJECT','HyperFrames must use the platform project identity');
     // A platform project may already contain metadata; never overwrite a composition.
     if (fs.existsSync(path.join(dir,'index.html')) || fs.existsSync(path.join(dir,'mediahub-hyperframes.json'))) throw error('PROJECT_EXISTS','This project already contains a composition');
     await fsp.mkdir(path.join(dir,'assets'),{recursive:true}); await fsp.mkdir(path.join(dir,'renders'),{recursive:true});
@@ -121,8 +122,9 @@ export class HyperframesAdapter {
       await page.setRequestInterception(true); page.on('request',request=>{ const url=request.url(); if (/^(data:|blob:)/.test(url) || url.startsWith(this.previewOrigin+'/')) request.continue(); else {blocked.push(url); request.abort();} });
       await page.goto(`${this.previewOrigin}/p/${project.id}/preview`,{waitUntil:'networkidle0',timeout:45000});
       await page.evaluate(()=>document.fonts.ready); await page.waitForFunction(()=>window.__playerReady===true,{timeout:15000});
+      const actualDuration=await page.evaluate(()=>window.__player.getDuration());
       const sampled=[];
-      for (const time of [0,.5,project.metadata.duration/2,Math.max(0,project.metadata.duration-.1)]) {
+      for (const time of [0,Math.min(.5,actualDuration/2),actualDuration/2,Math.max(0,actualDuration-.1)]) {
         await page.evaluate(async t=>{ const h=window.__player; if (!h?.seek) throw Error('Runtime player was not initialized'); await h.seek(t); await new Promise(requestAnimationFrame); },time);
         const sample=await page.evaluate(()=>{ const root=document.querySelector('[data-composition-id]'); const box=root?.getBoundingClientRect(); return {width:box?.width,height:box?.height,timelineCount:Object.keys(window.__timelines||{}).length,actualTime:window.__player?.getTime(),visibleText:[...document.querySelectorAll('h1,h2,p')].filter(el=>Number(getComputedStyle(el).opacity)>.5).length}; }); sampled.push({time,...sample});
       }
@@ -130,7 +132,7 @@ export class HyperframesAdapter {
       const seekOk=sampled.every(s=>Number.isFinite(s.actualTime)&&Math.abs(s.actualTime-s.time)<.05);
       const diagnosticsDir=path.join(project.dir,'.mediahub','checks'); await fsp.mkdir(diagnosticsDir,{recursive:true});
       const screenshot=path.join(diagnosticsDir,`check-${Date.now()}.png`); await page.screenshot({path:screenshot});
-      const browserResult={ok:errors.length===0 && blocked.length===0 && dimensionsOk && seekOk,errors,blockedRequests:blocked,sampled,dimensionsOk,seekOk,screenshot};
+      const browserResult={ok:errors.length===0 && blocked.length===0 && dimensionsOk && seekOk,errors,blockedRequests:blocked,sampled,dimensionsOk,seekOk,duration:actualDuration,screenshot};
       return {ok:lint.ok && browserResult.ok,lint,browser:browserResult};
     } finally { await browser.close(); this.browsers.delete(browser); }
   }
@@ -173,11 +175,11 @@ export class HyperframesAdapter {
       task.status='complete'; task.progress=100; task.stage='完成'; task.media=media; task.mediaValidated=true;
       task.artifact={path:task.outputPath,name:path.basename(task.outputPath),mediaValidated:true,media};
     } catch(e) { task.status=e.code==='CANCELLED'?'cancelled':'failed'; task.error=e.message; task.errorCode=e.code || 'RENDER_FAILED'; task.stage=task.status==='cancelled'?'已取消':'失败'; }
-    finally { task.worker=null; if(task.timer)clearTimeout(task.timer); task.endedAt=new Date().toISOString(); this.activeTask=null; await writeJson(task.recordPath,serialTask(task)).catch(()=>{}); this.emit({event:'task',...serialTask(task)}); task.resolveDone?.(serialTask(task)); }
+    finally { task.worker=null; if(task.timer)clearTimeout(task.timer); task.endedAt=new Date().toISOString(); await writeJson(task.recordPath,serialTask(task)).catch(()=>{}); this.activeTask=null; this.emit({event:'task',...serialTask(task)}); task.resolveDone?.(serialTask(task)); }
   }
   async cancel({taskId}) {
     const task=this.tasks.get(taskId); if(!task)throw error('TASK_NOT_FOUND','Task not found');
-    if(!['queued','rendering','validating'].includes(task.status))return {taskId,status:task.status,stopped:true};
+    if(!['queued','rendering','validating'].includes(task.status)){if(this.activeTask===taskId&&task.done)await task.done;return {taskId,status:task.status,stopped:true};}
     task.cancelRequested=true; task.worker?.send({type:'cancel'});
     task.timer=setTimeout(async()=>{ const pid=task.worker?.pid;if(!pid)return;try { if(process.platform==='win32')await exec(path.join(process.env.SystemRoot,'System32','taskkill.exe'),['/PID',String(pid),'/T','/F'],{windowsHide:true});else task.worker.kill('SIGKILL');}catch {} },15000);
     await task.done; return {taskId,status:task.status,stopped:true};
@@ -214,7 +216,7 @@ export class HyperframesAdapter {
       if(!['GET','HEAD'].includes(c.req.method)&&c.req.header('origin')!==this.studioOrigin)return c.text('Invalid origin',403);
       await next();});
     studio.get('/',c=>c.html(studioHtml(this.previewOrigin)));
-    studio.get('/mediahub/projects',c=>c.json([...this.projects.values()].map(p=>({...p.metadata,id:p.id,title:p.title,previewUrl:`${this.previewOrigin}/p/${p.id}/preview`}))));
+    studio.get('/mediahub/projects',async c=>{const projects=await Promise.all([...this.projects.values()].map(p=>this.project(p.dir)));return c.json(projects.map(p=>({...p.metadata,id:p.id,title:p.title,previewUrl:`${this.previewOrigin}/p/${p.id}/preview`})))});
     studio.get('/mediahub/projects/:id/source',async c=>{const p=this.projects.get(c.req.param('id'));if(!p)return c.text('Not found',404);return c.text(await fsp.readFile(await safeFile(p.dir,'index.html'),'utf8'));});
     studio.put('/mediahub/projects/:id/source',async c=>{const p=this.projects.get(c.req.param('id'));if(!p)return c.text('Not found',404);if(this.activeTask)return c.json({error:'导出时不能修改工程'},409);const source=await c.req.text();if(Buffer.byteLength(source)>2*1024*1024)return c.json({error:'Source exceeds 2 MiB'},413);await fsp.writeFile(await safeFile(p.dir,'index.html'),source);this.emit({event:'project-changed',projectId:p.id});return c.json({saved:true});});
     studio.post('/mediahub/projects/:id/check',async c=>{const p=this.projects.get(c.req.param('id'));if(!p)return c.text('Not found',404);return c.json(await this.check({projectDir:p.dir}));});

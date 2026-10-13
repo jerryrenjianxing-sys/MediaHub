@@ -33,9 +33,15 @@ async function main() {
   assert.equal(snapshot.tools.length, 4); assert.ok(snapshot.tools.every(t => t.status === 'not-installed'));
   assert.equal(fs.readdirSync(path.join(reportRoot, 'data', 'downloads')).length, 0);
   assert.ok(snapshot.workspace.path.startsWith(reportRoot));
-  await page.getByRole('button', { name: '切换亮暗主题' }).click();
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('button', { name: '深色', exact: true }).click();
+  await page.getByRole('button', { name: '连接 Agent', exact: true }).click();
+  await page.waitForFunction(() => document.documentElement.dataset.theme === 'dark');
   await page.screenshot({ path: path.join(reportRoot, 'home-dark.png') });
-  await page.getByRole('button', { name: '切换亮暗主题' }).click();
+  await page.getByRole('button', { name: '设置', exact: true }).click();
+  await page.getByRole('button', { name: '浅色', exact: true }).click();
+  await page.getByRole('button', { name: '连接 Agent', exact: true }).click();
+  await page.waitForFunction(() => document.documentElement.dataset.theme === 'light');
   await page.screenshot({ path: path.join(reportRoot, 'home-light.png') });
   for (const name of ['工具', '项目', '素材与成果', '安装与更新', '设置']) {
     await page.getByRole('button', { name, exact: true }).first().click();

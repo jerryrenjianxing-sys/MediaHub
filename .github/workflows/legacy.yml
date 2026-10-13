@@ -1,0 +1,29 @@
+name: Original tools clean Windows acceptance
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  original-tools:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+          cache: npm
+      - run: npm ci
+      - name: Verify and install original tools only in this disposable VM
+        shell: pwsh
+        run: ./scripts/accept-legacy.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mediahub-legacy-acceptance
+          path: |
+            work/legacy-acceptance/report.json
+            work/legacy-acceptance/evidence/*.json
+            work/legacy-acceptance/logs/*.log
+          if-no-files-found: warn
+          retention-days: 14

@@ -97,10 +97,12 @@ cp -- config.h config_components.h ffbuild/config.mak ffbuild/config.log "$SOURC
 "$BINARY_OUT/ffmpeg.exe" -hide_banner -encoders > "$BINARY_OUT/encoders.txt"
 for executable in ffmpeg ffprobe; do
   objdump -p "$BINARY_OUT/$executable.exe" > "$BINARY_OUT/$executable-pe-imports.txt"
+done
+for executable in ffmpeg ffprobe; do
   awk '/DLL Name:/{print $3}' "$BINARY_OUT/$executable-pe-imports.txt" | while IFS= read -r dll; do
     # Only Windows system DLLs are allowed. All media-library code is in the source archive.
     case "${dll,,}" in
-      api-ms-win-*.dll|ext-ms-win-*.dll|kernel32.dll|kernelbase.dll|ntdll.dll|msvcrt.dll|ucrtbase.dll|advapi32.dll|bcrypt.dll|ole32.dll|oleaut32.dll|user32.dll|gdi32.dll|shell32.dll|shlwapi.dll|winmm.dll|avrt.dll|psapi.dll|secur32.dll|ws2_32.dll|comdlg32.dll|comctl32.dll) ;;
+      api-ms-win-*.dll|ext-ms-win-*.dll|kernel32.dll|kernelbase.dll|ntdll.dll|msvcrt.dll|ucrtbase.dll|advapi32.dll|bcrypt.dll|ole32.dll|oleaut32.dll|user32.dll|gdi32.dll|shell32.dll|shlwapi.dll|winmm.dll|avrt.dll|avicap32.dll|msvfw32.dll|msacm32.dll|psapi.dll|secur32.dll|ws2_32.dll|comdlg32.dll|comctl32.dll) ;;
       *) printf 'Unexpected external DLL in %s: %s\n' "$executable" "$dll" >&2; exit 1 ;;
     esac
   done

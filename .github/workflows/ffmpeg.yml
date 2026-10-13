@@ -62,5 +62,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: mediahub-ffmpeg-build-diagnostics
-          path: work/ffmpeg-output/source/build-records
+          path: |
+            work/ffmpeg-output/source/build-records
+            work/ffmpeg-output/windows-x64
           if-no-files-found: warn

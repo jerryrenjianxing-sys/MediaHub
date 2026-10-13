@@ -99,11 +99,15 @@ async function componentHealth(toolId, context) {
     if (hash.digest('hex') !== file.sha256) throw new Error(`组件文件校验失败：${file.path}`);
     context.signal?.throwIfAborted();
   }
-  const status = await hf.start(root);
-  if (status?.healthy === false) throw new Error('HyperFrames 健康检查失败');
-  // Health check runs in staging and must release its handles before directory activation.
-  await hf.stop({ idleOnly: true });
-  return status;
+  try {
+    const status = await hf.start(root);
+    if (status?.healthy === false) throw new Error('HyperFrames 健康检查失败');
+    context.signal?.throwIfAborted();
+    return status;
+  } finally {
+    // Health check runs in staging and must release its handles before directory activation.
+    await hf.stop({ idleOnly: true });
+  }
 }
 async function invokeHyperframes(action, params, context = {}) {
   await hf.start(activeHyperframesRoot());
@@ -128,6 +132,13 @@ async function call(method, params = {}) {
   if (method === 'tools.import' && !params.toolId && !params.path) return manager.call('tools.rescan', {});
   if (method.startsWith('platform.updates/')) {
     if (!updates) throw new Error('当前开发运行不支持平台安装更新');
+    if (method === 'platform.updates/install') {
+      if (updates.snapshot().status !== 'downloaded') throw new Error('平台更新尚未下载完成');
+      if (hasWork()) throw new Error('请等待当前任务完成后安装平台更新');
+      // Return the acceptance receipt before restarting the process and closing its pipe.
+      setTimeout(() => updates.call('install').catch(error => log('update-install', error.message)), 150);
+      return { accepted: true, targetVersion: updates.snapshot().availableVersion, status: 'scheduled' };
+    }
     return updates.call(method.slice('platform.updates/'.length));
   }
   if (method === 'agent.connection') return snapshot().connection;
@@ -170,7 +181,10 @@ async function openStudio(projectId, bounds) {
   const origin = target.origin;
   studio.webContents.on('will-navigate', (event, url) => { if (new URL(url).origin !== origin) event.preventDefault(); });
   window.contentView.addChildView(studio); studio.setBounds(clampBounds(bounds));
-  await studio.webContents.loadURL(target.href);
+  const currentStudio = studio;
+  try { await currentStudio.webContents.loadURL(target.href); }
+  catch (error) { if (generation === studioGeneration) await closeStudio(); throw error; }
+  if (generation !== studioGeneration) return { cancelled: true };
   return { ready: true, projectId };
 }
 async function uiRequest(method, params = {}) {
@@ -309,9 +323,10 @@ else {
     startPipe();
     if (app.isPackaged) {
       const { autoUpdater } = require('electron-updater');
-      updates = new UpdateController({ updater: autoUpdater, version: app.getVersion(), beforeInstall: async () => {
+      if (profile) autoUpdater.installDirectory = path.dirname(app.getPath('exe'));
+      updates = new UpdateController({ updater: autoUpdater, version: app.getVersion(), installOptions: { silent: !!profile, forceRunAfter: !profile }, beforeInstall: async () => {
         if (hasWork()) { await dialog.showMessageBox(window, { type: 'info', message: '请等待当前任务完成后安装平台更新。' }); return false; }
-        quitting = true; await closeStudio(); await hf.stop(); await manager.close(); pipeServer?.kill(); return true;
+        quitting = true; await closeStudio(); await hf.stop({ idleOnly: true }); await manager.close(); pipeServer?.kill(); return true;
       } });
       updates.on('changed', changed);
     }

@@ -74,7 +74,7 @@ export default function App() {
     <header className="topbar">
       <button className="brand" onClick={() => navigate('connect')} aria-label="MediaHub 首页"><img src="./favicon.svg" alt="" width="29" height="29" /><span>MediaHub</span><span className="preview-mark">PREVIEW</span></button>
       <span className="topbar-tagline">你的 Agent，你的工具工作台。</span>
-      <div className="topbar-right"><span className={`service-status ${connected ? 'is-ready' : ''}`}><i />{loading ? '读取本机状态…' : connected ? '本机服务就绪' : '服务不可用'}</span><button className="icon-button" aria-label="切换亮暗主题" title={theme === 'system' ? '跟随系统，点击切换深色' : theme === 'dark' ? '深色，点击切换浅色' : '浅色，点击跟随系统'} onClick={() => void updateTheme(theme === 'system' ? 'dark' : theme === 'dark' ? 'light' : 'system')}><Icon name={theme === 'system' ? 'monitor' : theme === 'dark' ? 'moon' : 'sun'} /></button></div>
+      <div className="topbar-right"><span className={`service-status ${connected ? 'is-ready' : ''}`}><i />{loading ? '读取本机状态…' : connected ? '本机服务就绪' : '服务不可用'}</span><button className="icon-button" aria-label="切换亮暗主题" title={theme === 'system' ? '当前跟随系统，点击切换亮暗主题' : theme === 'dark' ? '切换到浅色主题' : '切换到深色主题'} onClick={() => void updateTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark')}><Icon name={theme === 'system' ? 'monitor' : theme === 'dark' ? 'moon' : 'sun'} /></button></div>
     </header>
     <aside className="sidebar" aria-label="主导航">
       <p className="nav-caption">工作台</p>

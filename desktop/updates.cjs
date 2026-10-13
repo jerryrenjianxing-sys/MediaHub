@@ -2,8 +2,8 @@
 const { EventEmitter } = require('node:events');
 const DEFAULT_FEED = 'https://raw.githubusercontent.com/jerryrenjianxing-sys/MediaHub/distribution/updates';
 class UpdateController extends EventEmitter {
-  constructor({ updater, version, beforeInstall, feed = DEFAULT_FEED }) {
-    super(); this.updater = updater; this.beforeInstall = beforeInstall;
+  constructor({ updater, version, beforeInstall, feed = DEFAULT_FEED, installOptions = { silent: false, forceRunAfter: true } }) {
+    super(); this.updater = updater; this.beforeInstall = beforeInstall; this.installOptions = installOptions;
     this.state = { status: 'idle', currentVersion: version, availableVersion: null, percent: 0, error: null, checkedAt: null };
     updater.autoDownload = false; updater.autoInstallOnAppQuit = false;
     updater.allowPrerelease = true; updater.allowDowngrade = false;
@@ -27,7 +27,7 @@ class UpdateController extends EventEmitter {
     if (action === 'install') {
       if (this.state.status !== 'downloaded') throw new Error('平台更新尚未下载完成');
       if (!await this.beforeInstall()) return this.snapshot();
-      this.patch({ status: 'installing' }); this.updater.quitAndInstall(false, true); return this.snapshot();
+      this.patch({ status: 'installing' }); this.updater.quitAndInstall(this.installOptions.silent, this.installOptions.forceRunAfter); return this.snapshot();
     }
     if (action === 'dismiss') return this.snapshot();
     throw new Error('未知的平台更新操作');

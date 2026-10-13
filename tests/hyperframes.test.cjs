@@ -20,7 +20,7 @@ test('real Producer render and ffprobe success, one-render limit, actual cancell
 
 test('Studio browser playback, source saving, automatic refresh and shared rendering',{skip:!runtimePresent,timeout:120000},async t=>{
   const {root,adapter,events}=await fixture(t); const projectDir=path.join(root,'Studio 竖屏');
-  await fs.mkdir(projectDir,{recursive:true});const platformId='project-6a513c9d-5362-49aa-a23b-e4ec937bbfd6';await fs.writeFile(path.join(projectDir,'project.json'),JSON.stringify({id:platformId,name:'平台项目',path:projectDir}));
+  await fs.mkdir(projectDir,{recursive:true});const platformId='project_6a513c9d-5362-49aa-a23b-e4ec937bbfd6';await fs.writeFile(path.join(projectDir,'project.json'),JSON.stringify({id:platformId,name:'平台项目',path:projectDir}));
   const created=await adapter.create({projectDir,projectId:platformId,title:'Studio 验收',orientation:'portrait',duration:2});assert.equal(created.projectId,platformId);assert.equal((JSON.parse(await fs.readFile(path.join(projectDir,'project.json'),'utf8'))).name,'平台项目');
   const urls=await adapter.preview({projectDir}); const {default:puppeteer}=await import(pathToFileURL(path.join(repo,'tools','hyperframes','node_modules','puppeteer-core','lib','puppeteer','puppeteer-core.js')));
   const browser=await puppeteer.launch({executablePath:adapter.runtime.chrome,headless:true,args:['--disable-gpu','--disable-background-networking']}); t.after(()=>browser.close());
@@ -34,8 +34,9 @@ test('Studio browser playback, source saving, automatic refresh and shared rende
   await page.click('#play');await new Promise(r=>setTimeout(r,100));assert.equal(await getPreview().evaluate(()=>window.__player.isPlaying()),true);await page.click('#play');
   await page.evaluate(()=>{const source=document.getElementById('source');source.value=source.value.replaceAll('Studio 验收','已保存的作品');source.dispatchEvent(new Event('input'));});await page.click('#save');await page.waitForFunction(()=>document.getElementById('message').textContent.includes('已保存'));
   assert.match(await fs.readFile(path.join(projectDir,'index.html'),'utf8'),/已保存的作品/);
-  let source=await fs.readFile(path.join(projectDir,'index.html'),'utf8');await fs.writeFile(path.join(projectDir,'index.html'),source.replaceAll('已保存的作品','Agent 自动刷新'));
+  let source=await fs.readFile(path.join(projectDir,'index.html'),'utf8');await fs.writeFile(path.join(projectDir,'index.html'),source.replaceAll('已保存的作品','Agent 自动刷新').replace('data-duration="2"','data-duration="3"'));
   await page.waitForFunction(()=>document.getElementById('source').value.includes('Agent 自动刷新'),{timeout:10000});
+  await page.waitForFunction(()=>document.getElementById('seek').max==='3');
   await waitFor(async()=>{try{return await getPreview()?.evaluate(()=>document.querySelector('.title')?.textContent.includes('Agent 自动刷新'));}catch{return false;}},10000);
   await new Promise(r=>setTimeout(r,200));
   await page.screenshot({path:path.join(root,'Studio-desktop.png'),fullPage:true});

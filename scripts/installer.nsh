@@ -1,6 +1,6 @@
 !macro customInit
   ${If} $hasPerUserInstallation != "1"
-    Call GetDParameter
+    !insertmacro GetDParameter $R0
     ${If} $R0 == ""
       StrCpy $INSTDIR "$LOCALAPPDATA\MediaHub\app"
     ${EndIf}
