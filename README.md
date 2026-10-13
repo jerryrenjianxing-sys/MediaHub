@@ -2,7 +2,7 @@
 
 Windows 本地媒体工具工作台：先安装平台，再按需安装工具。界面和 Agent 使用同一套工具、项目、素材、任务与成果管理入口。
 
-这是未签名的 Windows x64 预览版。安装器和 ZIP 在 [Releases](https://github.com/jerryrenjianxing-sys/MediaHub/releases) 下载；平台安装包不包含四套工具。
+当前交付为平台 **0.1.0-preview.3**、HyperFrames 工具包 **0.1.0-preview.2**，均为未签名 Windows x64 预览版。[下载平台安装器与 ZIP](https://github.com/jerryrenjianxing-sys/MediaHub/releases/tag/v0.1.0-preview.3)；平台安装包不包含四套工具。
 
 ## 首轮接入
 
@@ -13,7 +13,7 @@ Windows 本地媒体工具工作台：先安装平台，再按需安装工具。
 | MediaSail | 同上；保留原账号、浏览器会话和业务数据 |
 | HyperFrames | 独立下载的完整组件；平台负责安装、启动、更新、恢复和卸载 |
 
-三个旧工具继续独立发行。MediaHub 不自动移动它们的数据库或登录资料。界面明确标明“由原软件管理”，不会把打开入口当作更新或卸载成功。
+三个旧工具继续独立发行。MediaHub 不自动移动它们的数据库或登录资料。界面明确标明“由原软件管理”，不会把打开入口当作更新或卸载成功。MediaFlow 原 dev.48 安装器在干净 VM 的中文安装目录创建快捷方式失败，建议先选择英文安装路径，详见验收记录。
 
 ## 使用
 
