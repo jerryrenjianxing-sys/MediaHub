@@ -22,7 +22,7 @@ Input and output are UTF-8 NDJSON on stdin/stdout. Requests are `{ "id": "reques
 
 Events: `{event:'progress',taskId,progress,stage}`, `{event:'task',taskId,status,...}` and `{event:'project-changed',projectId}`. Task state includes `source:'agent'|'studio'`, projectId, projectDir, start/end times. Only a successful worker exit followed by bundled ffprobe validation returns `artifact:{path,name,mediaValidated:true,media}`. The platform must persist these events and index only validated artifacts. Interrupted task records are never replayed automatically.
 
-One render runs at a time. First release exports H.264 MP4, SDR, authored 1920×1080 or 1080×1920, 30fps. Templates use local assets. Tool removal never removes projects.
+One render runs at a time. Each render has its own native Windows Job Object: forced cancellation closes that Job and reclaims its Node worker, Chrome and FFmpeg descendants, including detached processes. The helper and its MIT source are inside the independent component. First release exports H.264 MP4, SDR, authored 1920×1080 or 1080×1920, 30fps. Templates use local assets. Tool removal never removes projects.
 
 ## Studio and isolation
 

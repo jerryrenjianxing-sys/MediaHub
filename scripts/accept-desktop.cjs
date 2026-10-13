@@ -12,6 +12,7 @@ const executable = process.env.MEDIAHUB_ACCEPTANCE_EXE || path.join(root, 'node_
 const port = Number(process.env.MEDIAHUB_ACCEPTANCE_PORT || 9446);
 const args = process.env.MEDIAHUB_ACCEPTANCE_EXE ? [] : [root];
 args.push('--mediahub-profile', profilePath, `--remote-debugging-port=${port}`, '--remote-debugging-address=127.0.0.1');
+if (process.env.MEDIAHUB_ACCEPTANCE_SCALE) args.push(`--force-device-scale-factor=${Number(process.env.MEDIAHUB_ACCEPTANCE_SCALE)}`);
 const env = { ...process.env }; delete env.ELECTRON_RUN_AS_NODE;
 const log = fs.createWriteStream(path.join(reportRoot, 'electron-output.log'));
 const child = spawn(executable, args, { cwd: root, windowsHide: true, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -30,6 +31,7 @@ async function main() {
   await page.waitForFunction(() => !!window.mediaHub, { timeout: 20000 });
   const errors = []; page.on('pageerror', error => errors.push(error.message));
   const snapshot = await page.evaluate(() => window.mediaHub.call('platform.snapshot'));
+  const observedWindow = await page.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio }));
   assert.equal(snapshot.tools.length, 4); assert.ok(snapshot.tools.every(t => t.status === 'not-installed'));
   assert.equal(fs.readdirSync(path.join(reportRoot, 'data', 'downloads')).length, 0);
   assert.ok(snapshot.workspace.path.startsWith(reportRoot));
@@ -54,7 +56,7 @@ async function main() {
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth), false, 'Horizontal overflow');
   assert.equal(await page.evaluate(() => typeof window.require), 'undefined');
   assert.deepEqual(errors, []);
-  fs.writeFileSync(path.join(reportRoot, 'result.json'), JSON.stringify({ version: snapshot.version, passed: true, baseDownloads: 0, tools: snapshot.tools.map(t => ({ id: t.id, state: t.status })), screenshots: 8, testedResolutions: ['1280x850', '1024x768'], connectionAvailable: snapshot.connection.available, profile: 'acceptance', projectCreated: project.id, tests: ['shared workspace', 'four uninstalled tools', 'empty downloads', 'themes', 'navigation', 'Chinese/spaces', 'no renderer Node', 'no page errors'], completedAt: new Date().toISOString() }, null, 2));
+  fs.writeFileSync(path.join(reportRoot, 'result.json'), JSON.stringify({ version: snapshot.version, passed: true, baseDownloads: 0, tools: snapshot.tools.map(t => ({ id: t.id, state: t.status })), screenshots: 8, observedWindow, narrowContentViewport: { width: 1024, height: 768 }, appScaleOverride: process.env.MEDIAHUB_ACCEPTANCE_SCALE || null, connectionAvailable: snapshot.connection.available, profile: 'acceptance', tests: ['shared workspace', 'four uninstalled tools', 'empty downloads', 'themes', 'navigation', 'Chinese/spaces', 'no renderer Node', 'no page errors'], completedAt: new Date().toISOString() }, null, 2));
   await page.evaluate(() => window.mediaHub.call('platform.quit')).catch(error => { if (!/closed|destroyed/i.test(error.message)) throw error; });
   await browser.close().catch(() => {});
 }

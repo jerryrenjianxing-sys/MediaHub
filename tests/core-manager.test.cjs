@@ -54,6 +54,19 @@ test('empty platform has no payload, creates isolated workspace and copies asset
   assert.ok(artifact.id); assert.equal(manager.snapshot().artifacts.length, 1);
   await assert.rejects(manager.call('artifacts.register', { projectId: project.id, path: source }), { code: 'INVALID_PATH' });
   await assert.rejects(manager.call('workspace.set', { path: path.join(root, 'platform', 'components', 'bad') }), { code: 'INVALID_PATH' });
+  await assert.rejects(manager.call('workspace.set', { path: path.join(root, 'platform', 'desktop') }), { code: 'INVALID_PATH' });
+  await assert.rejects(manager.call('workspace.set', { path: root }), { code: 'INVALID_PATH' });
+  await assert.rejects(manager.call('artifacts.register', { projectId: project.id, path: output, toolId: 'hyperframes', mediaValidated: true }), { code: 'MEDIA_NOT_VALIDATED' });
+});
+
+test('workspace stays outside the packaged program and stopping a component does not overwrite an installation state', async t => {
+  const programRoot = path.join(os.tmpdir(), 'MediaHub packaged ' + crypto.randomUUID());
+  const { manager } = isolated(t, { programRoot, externalRecords: [{ id: 'hyperframes', status: 'installed', version: '1.0.0' }] });
+  await manager.ready;
+  await assert.rejects(manager.call('workspace.set', { path: path.join(programRoot, 'project') }), { code: 'INVALID_PATH' });
+  const before = (await manager.call('tools.status', { toolId: 'hyperframes' })).status;
+  manager.componentStopped('hyperframes');
+  assert.equal((await manager.call('tools.status', { toolId: 'hyperframes' })).status, before);
 });
 
 test('external management opens original entry and never deletes its data', async t => {

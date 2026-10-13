@@ -2,8 +2,10 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { fork, execFile } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import readline from 'node:readline';
 import { promisify } from 'node:util';
+import { Readable } from 'node:stream';
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { streamSSE } from 'hono/streaming';
@@ -18,6 +20,7 @@ const exec = promisify(execFile);
 const error = (code, message) => Object.assign(new Error(message), { code });
 const jsonRead = async file => JSON.parse(await fsp.readFile(file, 'utf8'));
 const writeJson = async (file, value) => { await fsp.mkdir(path.dirname(file), {recursive:true}); const temp = `${file}.${crypto.randomUUID()}.tmp`; await fsp.writeFile(temp, JSON.stringify(value, null, 2)); await fsp.rename(temp, file); };
+const hashFile = async file => {const digest=crypto.createHash('sha256');for await(const chunk of fs.createReadStream(file))digest.update(chunk);return digest.digest('hex');};
 function serialTask(task) { const {worker,done,resolveDone,timer,...value} = task; return value; }
 function inside(root, target) { const rel = path.relative(root, target); return !path.isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${path.sep}`); }
 async function safeFile(root, relative) { const full = path.resolve(root, relative); if (!inside(root, full)) throw error('INVALID_PATH','File must be inside the project'); const canonical = await fsp.realpath(full); if (!inside(await fsp.realpath(root), canonical)) throw error('INVALID_PATH','Links outside the project are not allowed'); return canonical; }
@@ -25,10 +28,11 @@ async function listen(app) { return new Promise((resolve,reject) => { const serv
 async function closeServer(server) { if (!server) return; server.closeAllConnections?.(); await new Promise(resolve=>server.close(resolve)); }
 
 export class HyperframesAdapter {
-  constructor({onEvent=()=>{}, runtime}={}) {
+  constructor({onEvent=()=>{}, runtime,cancelTimeoutMs=15000}={}) {
     this.runtime=runtime || applyRuntimeEnvironment(); this.onEvent=onEvent;
     this.projects=new Map(); this.tasks=new Map(); this.activeTask=null; this.closed=false;
-    this.watchers=new Map(); this.clients=new Set(); this.browsers=new Set(); this.browserLaunches=new Set(); this.instanceToken=crypto.randomBytes(32).toString('hex'); this.connected=false;
+    this.cancelTimeoutMs=cancelTimeoutMs;
+    this.watchers=new Map(); this.clients=new Set(); this.browsers=new Set(); this.browserLaunches=new Set(); this.pendingStudio=new Map(); this.instanceToken=crypto.randomBytes(32).toString('hex'); this.connected=false;
   }
   emit(value) { this.onEvent(value); for (const notify of this.clients) notify(value); }
   async dispatch(method, params={}) {
@@ -85,7 +89,7 @@ export class HyperframesAdapter {
     for (const asset of assets) {
       if (!/^[a-zA-Z0-9_.-]{1,120}$/.test(asset.assetId || '') || !path.isAbsolute(asset.sourcePath || '')) throw error('INVALID_ASSET','Each asset needs an assetId and absolute sourcePath');
       const sourcePath=await fsp.realpath(asset.sourcePath); if (!(await fsp.stat(sourcePath)).isFile()) throw error('INVALID_ASSET','Asset must be a file');
-      const sha256=crypto.createHash('sha256').update(await fsp.readFile(sourcePath)).digest('hex');
+      const sha256=await hashFile(sourcePath);
       const filename=`${asset.assetId}-${sha256.slice(0,12)}${path.extname(sourcePath).toLowerCase()}`;
       const relativePath=`assets/${filename}`; await fsp.copyFile(sourcePath,path.join(project.dir,relativePath));
       const mapping={assetId:asset.assetId,sourcePath,relativePath,sha256,importedAt:new Date().toISOString()};
@@ -151,7 +155,9 @@ export class HyperframesAdapter {
     if (fs.existsSync(target)) throw error('OUTPUT_EXISTS','Existing output is never overwritten');
     const task={id:taskId,taskId,projectId:project.id,projectDir:project.dir,source,status:'queued',progress:0,stage:'检查工程',outputPath:target,startedAt:new Date().toISOString(),recordPath:path.join(project.dir,'.mediahub','tasks',`${taskId}.json`)};
     task.done=new Promise(resolve=>task.resolveDone=resolve); this.tasks.set(taskId,task); this.activeTask=taskId;
-    await writeJson(task.recordPath,serialTask(task)); this.emit({event:'task',...serialTask(task)});
+    try{await writeJson(task.recordPath,serialTask(task));}
+    catch(e){task.status='failed';task.error=e.message;task.errorCode=e.code || 'TASK_RECORD_FAILED';task.stage='任务记录失败';task.endedAt=new Date().toISOString();if(task.timer)clearTimeout(task.timer);this.activeTask=null;this.emit({event:'task',...serialTask(task)});task.resolveDone(serialTask(task));throw e;}
+    this.emit({event:'task',...serialTask(task)});
     void this.execute(task,quality,composition,variables);
     return task;
     } finally { this.renderStarting=false; }
@@ -163,10 +169,11 @@ export class HyperframesAdapter {
       if (task.cancelRequested) throw error('CANCELLED','Cancelled before render started');
       if (composition || variables) throw error('UNSUPPORTED_RENDER_OPTION','First release renders the project index without variable overrides');
       task.status='rendering'; task.stage='准备导出'; await writeJson(task.recordPath,serialTask(task));
-      const child=fork(path.join(componentRoot,'render-worker.mjs'),[],{execPath:this.runtime.node,execArgv:[],cwd:task.projectDir,env:{...process.env},stdio:['ignore','ignore','pipe','ipc'],windowsHide:true}); task.worker=child;
+      const child=spawn(this.runtime.native,['job','--',this.runtime.node,path.join(componentRoot,'render-worker.mjs')],{cwd:task.projectDir,env:{...process.env},stdio:['pipe','pipe','pipe'],windowsHide:true}); task.worker=child;
       let result=null; let stderr=''; child.stderr.on('data',chunk=>{stderr=(stderr+chunk).slice(-4000);});
-      child.on('message',message=>{ if (message.type==='progress') { task.progress=Math.max(task.progress,Math.min(99,Number(message.progress)||0)); task.stage=message.stage; this.emit({event:'progress',taskId:task.id,progress:task.progress,stage:task.stage}); } else result=message; });
-      await new Promise((resolve,reject)=>{child.once('error',reject);child.once('exit',(code,signal)=>{ if (task.cancelRequested || result?.code==='CANCELLED') reject(error('CANCELLED','视频导出已取消')); else if (code!==0 || result?.type!=='complete') reject(error(result?.code || 'RENDER_FAILED',result?.message || `Worker stopped (${code ?? signal}): ${stderr}`)); else resolve(); }); child.send({type:'render',projectDir:task.projectDir,outputPath:task.outputPath,quality});});
+      readline.createInterface({input:child.stdout}).on('line',line=>{let message;try{message=JSON.parse(line);}catch{return;}if (message.type==='progress') { task.progress=Math.max(task.progress,Math.min(99,Number(message.progress)||0)); task.stage=message.stage; this.emit({event:'progress',taskId:task.id,progress:task.progress,stage:task.stage}); } else result=message; });
+      child.stdin.on('error',()=>{});
+      await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',(code,signal)=>{ if (task.cancelRequested || result?.code==='CANCELLED') reject(error('CANCELLED','视频导出已取消')); else if (code!==0 || result?.type!=='complete') reject(error(result?.code || 'RENDER_FAILED',result?.message || `Render process group stopped (${code ?? signal}): ${stderr}`)); else resolve(); }); child.stdin.write(JSON.stringify({type:'render',projectDir:task.projectDir,outputPath:task.outputPath,quality})+'\n');});
       task.worker=null; task.status='validating'; task.stage='校验成片';
       const {stdout}=await exec(this.runtime.ffprobe,['-v','error','-show_format','-show_streams','-of','json',task.outputPath],{windowsHide:true,timeout:30000,maxBuffer:1024*1024});
       const media=JSON.parse(stdout); const video=media.streams?.find(s=>s.codec_type==='video'); const project=await this.project(task.projectDir);
@@ -180,15 +187,18 @@ export class HyperframesAdapter {
   async cancel({taskId}) {
     const task=this.tasks.get(taskId); if(!task)throw error('TASK_NOT_FOUND','Task not found');
     if(!['queued','rendering','validating'].includes(task.status)){if(this.activeTask===taskId&&task.done)await task.done;return {taskId,status:task.status,stopped:true};}
-    task.cancelRequested=true; task.worker?.send({type:'cancel'});
-    task.timer=setTimeout(async()=>{ const pid=task.worker?.pid;if(!pid)return;try { if(process.platform==='win32')await exec(path.join(process.env.SystemRoot,'System32','taskkill.exe'),['/PID',String(pid),'/T','/F'],{windowsHide:true});else task.worker.kill('SIGKILL');}catch {} },15000);
+    if(task.cancelRequested){await task.done;return {taskId,status:task.status,stopped:true};}
+    task.cancelRequested=true;task.worker?.stdin.write(JSON.stringify({type:'cancel'})+'\n');
+    // Killing this wrapper closes only this render's native Job Object, including detached descendants.
+    task.timer=setTimeout(()=>{task.worker?.kill('SIGKILL');},this.cancelTimeoutMs);
     await task.done; return {taskId,status:task.status,stopped:true};
   }
   async status({taskId,projectDir}={}) {
     if(projectDir)await this.project(projectDir);
-    const runtime={...this.runtime}; const healthy=['node','chrome','ffmpeg','ffprobe','font'].every(k=>fs.existsSync(runtime[k]));
+    const runtime={...this.runtime}; const healthy=['node','chrome','ffmpeg','ffprobe','font','native'].every(k=>runtime[k]&&fs.existsSync(runtime[k]));
     if(taskId){const task=this.tasks.get(taskId);if(!task)throw error('TASK_NOT_FOUND','Task not found');return serialTask(task);}
-    return {healthy,versions,runtime,activeRender:this.activeTask,tasks:[...this.tasks.values()].map(serialTask),pid:process.pid};
+    const tasks=[...this.tasks.values()].slice(-100).map(t=>({taskId:t.taskId,id:t.id,source:t.source,projectId:t.projectId,status:t.status,progress:t.progress,stage:t.stage,outputPath:t.outputPath,error:t.error,startedAt:t.startedAt,endedAt:t.endedAt}));
+    return {healthy,versions,runtime,activeRender:this.activeTask,taskCount:this.tasks.size,tasks,pid:process.pid};
   }
   async preview({projectDir}) {
     const project=await this.project(projectDir); assertRuntime(this.runtime);await this.ensureServers();
@@ -207,7 +217,18 @@ export class HyperframesAdapter {
       // The preview knows only the parent's origin, never its instance token or cookie.
       const bridge=`<script>addEventListener('message',e=>{if(e.source!==parent||e.origin!==${JSON.stringify(this.studioOrigin)}||e.data?.source!=='mediahub-studio')return;const h=window.__player;if(e.data.action==='seek')h?.seek(e.data.time);if(e.data.action==='play')h?.play();if(e.data.action==='pause')h?.pause();});const readyTimer=setInterval(()=>{if(window.__playerReady&&window.__player){clearInterval(readyTimer);parent.postMessage({source:'mediahub-preview',type:'ready'},${JSON.stringify(this.studioOrigin)});}},25);setTimeout(()=>clearInterval(readyTimer),30000);</script>`;
       return c.html(html.replace('</body>',bridge+'</body>'));});
-    preview.get('/p/:id/files/*',async c=>{const project=this.projects.get(c.req.param('id'));if(!project)return c.text('Not found',404);const relative=decodeURIComponent(new URL(c.req.url).pathname.split('/files/')[1]||'');if(relative.split(/[\\/]/).some(segment=>segment.startsWith('.')) || /(?:mediahub-hyperframes|project)\.json$/i.test(relative))return c.text('Not found',404);try{const file=await safeFile(project.dir,relative);if(!(await fsp.stat(file)).isFile())return c.text('Not found',404);return c.body(await fsp.readFile(file),200,{'Content-Type':getMimeType(file)});}catch{return c.text('Not found',404);}});
+    preview.get('/p/:id/files/*',async c=>{
+      const project=this.projects.get(c.req.param('id'));if(!project)return c.text('Not found',404);
+      const relative=decodeURIComponent(new URL(c.req.url).pathname.split('/files/')[1]||'');if(relative.split(/[\\/]/).some(segment=>segment.startsWith('.')) || /(?:mediahub-hyperframes|project)\.json$/i.test(relative))return c.text('Not found',404);
+      try{const file=await safeFile(project.dir,relative);const stat=await fsp.stat(file);if(!stat.isFile())return c.text('Not found',404);const range=c.req.header('range');let start=0,end=stat.size-1,status=200;
+        if(range){const match=range.match(/^bytes=(\d*)-(\d*)$/);if(!match || (!match[1]&&!match[2]))return c.body(null,416,{'Content-Range':`bytes */${stat.size}`});
+          if(!match[1])start=Math.max(0,stat.size-Number(match[2]));else start=Number(match[1]);if(match[1]&&match[2])end=Math.min(end,Number(match[2]));
+          if(!Number.isSafeInteger(start)||!Number.isSafeInteger(end)||start>end||start>=stat.size)return c.body(null,416,{'Content-Range':`bytes */${stat.size}`});status=206;
+        }
+        const headers={'Content-Type':getMimeType(file),'Accept-Ranges':'bytes','Content-Length':String(Math.max(0,end-start+1))};if(status===206)headers['Content-Range']=`bytes ${start}-${end}/${stat.size}`;
+        if(stat.size===0)return c.body(null,200,headers);return c.body(Readable.toWeb(fs.createReadStream(file,{start,end})),status,headers);
+      }catch{return c.text('Not found',404);}
+    });
     const p=await listen(preview);this.previewServer=p.server;this.previewPort=p.port;this.previewOrigin=`http://127.0.0.1:${p.port}`;
     const studio=new Hono();
     studio.use('*',async(c,next)=>{ if(c.req.header('host')!==`localhost:${this.studioPort}`)return c.text('Invalid host',403);c.header('Referrer-Policy','no-referrer');c.header('X-Content-Type-Options','nosniff');c.header('Content-Security-Policy',`default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-src ${this.previewOrigin}; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`);
@@ -222,16 +243,27 @@ export class HyperframesAdapter {
     studio.post('/mediahub/projects/:id/check',async c=>{const p=this.projects.get(c.req.param('id'));if(!p)return c.text('Not found',404);return c.json(await this.check({projectDir:p.dir}));});
     studio.get('/mediahub/projects/:id/lint',async c=>{const p=this.projects.get(c.req.param('id'));if(!p)return c.text('Not found',404);return c.json(await this.lint({projectDir:p.dir}));});
     studio.post('/mediahub/tasks/:id/cancel',async c=>c.json(await this.cancel({taskId:c.req.param('id')})));
+    studio.post('/api/render/:jobId/cancel',async c=>{const taskId=c.req.param('jobId');try{const pending=this.pendingStudio.get(taskId);if(pending)await pending;return c.json(await this.cancel({taskId}));}catch(e){return c.json({error:e.message,code:e.code || 'CANCEL_FAILED',stopped:false},e.code==='TASK_NOT_FOUND'?404:409);}});
     studio.get('/mediahub/events',c=>streamSSE(c,async stream=>{const notify=value=>stream.writeSSE({data:JSON.stringify(value)}).catch(()=>{});this.clients.add(notify);await new Promise(resolve=>stream.onAbort(resolve));this.clients.delete(notify);}));
     const studioAdapter={listProjects:()=>[...this.projects.values()],resolveProject:id=>this.projects.get(id)||null,bundle:(dir,options)=>bundleToSingleHtml(dir,{...options,inlineAssets:true}),lint:(html,opts)=>lintHyperframeHtml(html,opts),lintProject:dir=>lintProject(dir),runtimeUrl:`${this.previewOrigin}/runtime.js`,rendersDir:project=>path.join(project.dir,'renders'),startRender:opts=>{
       const state={id:opts.jobId,status:'rendering',progress:0,stage:'准备',outputPath:opts.outputPath};
       if(opts.format!=='mp4'||opts.fps.num!==30||opts.fps.den!==1){state.status='failed';state.error='首版仅支持 MP4 / 30fps / SDR';return state;}
-      this.startTask({projectDir:opts.project.dir,taskId:opts.jobId,quality:opts.quality,outputPath:opts.outputPath,source:'studio',composition:opts.composition,variables:opts.variables}).then(task=>{
+      const pending=this.startTask({projectDir:opts.project.dir,taskId:opts.jobId,quality:opts.quality,outputPath:opts.outputPath,source:'studio',composition:opts.composition,variables:opts.variables});this.pendingStudio.set(opts.jobId,pending);pending.then(task=>{
         state.cancel=()=>{void this.cancel({taskId:task.id});};const timer=setInterval(()=>{state.progress=task.progress;state.stage=task.stage;},200);task.done.then(result=>{clearInterval(timer);state.status=result.status==='complete'?'complete':result.status==='cancelled'?'cancelled':'failed';state.progress=result.progress;state.error=result.error;});
-      }).catch(e=>{state.status='failed';state.error=e.message;});return state;
+      }).catch(e=>{state.status='failed';state.error=e.message;}).finally(()=>this.pendingStudio.delete(opts.jobId));return state;
     }};
+    studio.post('/api/projects/:id/render',async c=>{
+      const project=this.projects.get(c.req.param('id'));if(!project)return c.json({error:'Project not found'},404);
+      const body=await c.req.json().catch(()=>({}));if((body.format&&body.format!=='mp4')||(body.fps!==undefined&&Number(body.fps)!==30))return c.json({error:'首版仅支持 MP4 / 30fps / SDR'},400);
+      const jobId=`studio_${crypto.randomUUID()}`;const state=studioAdapter.startRender({project,outputPath:path.join(project.dir,'renders',`${jobId}.mp4`),jobId,format:'mp4',fps:{num:30,den:1},quality:body.quality || 'standard',composition:body.composition,variables:body.variables,telemetryOptOut:true});
+      try{const pending=this.pendingStudio.get(jobId);if(pending)await pending;else if(state.status==='failed')throw error('INVALID_RENDER',state.error);return c.json({jobId,status:'rendering'});}
+      catch(e){return c.json({error:e.message,code:e.code || 'RENDER_FAILED'},e.code==='RENDER_BUSY'?409:400);}
+    });
+    studio.get('/api/render/:jobId/progress',c=>{const task=this.tasks.get(c.req.param('jobId'));if(!task)return c.json({error:'Task not found'},404);return streamSSE(c,async stream=>{
+      while(!stream.aborted){await stream.writeSSE({event:'progress',data:JSON.stringify({progress:task.progress,status:task.status,stage:task.stage,error:task.error})});if(!['queued','rendering','validating'].includes(task.status))break;await new Promise(resolve=>setTimeout(resolve,250));}
+    });});
     // Deliberately expose only supported routes. Global assets/registry/install APIs are unavailable.
-    studio.use('/api/*',async(c,next)=>{const allowed=/^\/api\/(?:projects(?:\/[^/]+(?:\/lint|\/render|\/renders(?:\/[^/]+)?))?|render\/[^/]+\/(?:progress|cancel))$/.test(c.req.path);if(!allowed)return c.json({error:'Unsupported studio route'},404);await next();});
+    studio.use('/api/*',async(c,next)=>{const allowed=/^\/api\/(?:projects(?:\/[^/]+(?:\/lint|\/render))?|render\/[^/]+\/progress)$/.test(c.req.path);if(!allowed)return c.json({error:'Unsupported studio route'},404);await next();});
     studio.route('/api',createStudioApi(studioAdapter));
     const s=await listen(studio);this.studioServer=s.server;this.studioPort=s.port;this.studioOrigin=`http://localhost:${s.port}`;
   }
