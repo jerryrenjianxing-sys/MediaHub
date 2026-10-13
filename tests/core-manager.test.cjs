@@ -174,3 +174,21 @@ test('a stopped Studio task becomes interrupted and no longer blocks shutdown', 
   assert.equal(manager.busy, false); assert.equal((await manager.call('tasks.get', { taskId })).state, 'interrupted');
   assert.deepEqual(await manager.call('artifacts.list'), []); await manager.close();
 });
+
+test('insufficient disk space refuses component installation and keeps project data', async t => {
+  const release = { id: 'hyperframes', name: 'HyperFrames', kind: 'component', version: '1.0.0', package: { url: 'https://example.invalid/tool.zip', sha256: '0'.repeat(64), bytes: 1024 } };
+  const { manager, root } = isolated(t, { catalog: { tools: [release] }, onComponentHealth: async () => { throw new Error('must not reach health check'); } });
+  await manager.ready; const project = await manager.call('projects.create', { name: 'preserve low disk' });
+  t.mock.method(fs, 'statfsSync', () => ({ bavail: 0, bsize: 4096 }));
+  const operation = await manager.call('tools.install', { toolId: 'hyperframes' }); const result = await terminal(manager, operation.id);
+  assert.equal(result.state, 'failed'); assert.equal(result.error.code, 'DISK_SPACE');
+  assert.ok(fs.existsSync(path.join(project.path, 'project.json'))); assert.equal(fs.readdirSync(path.join(root, 'platform/downloads')).length, 0);
+  assert.equal(fs.existsSync(path.join(root, 'platform/components/hyperframes/active.json')), false);
+});
+
+test('network failure leaves no partial downloaded package or successful receipt', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mediahub-offline-')); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  t.mock.method(https, 'get', () => { const request = new EventEmitter(); request.setTimeout = () => request; process.nextTick(() => request.emit('error', Object.assign(new Error('network unreachable'), { code: 'ENETUNREACH' }))); return request; });
+  await assert.rejects(downloadVerified({ url: 'https://example.invalid/tool.zip', sha256: '0'.repeat(64), bytes: 100 }, path.join(root, 'tool.zip')), { code: 'ENETUNREACH' });
+  assert.deepEqual(fs.readdirSync(root), []);
+});
