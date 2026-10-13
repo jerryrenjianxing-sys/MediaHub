@@ -35,7 +35,7 @@ fs.mkdirSync(path.join(dataRoot, 'logs'), { recursive: true });
 function log(kind, value) { fs.appendFileSync(path.join(dataRoot, 'logs/desktop.log'), `${new Date().toISOString()} ${kind} ${String(value).slice(0, 8000)}\n`); }
 const hf = new HyperframesClient({ helperPath, log });
 
-function snapshot() { return { ...manager.snapshot(), platformUpdates: updates?.snapshot() || { status: 'unavailable', currentVersion: app.getVersion(), error: '开发模式未启用平台升级' }, connection: { ...(manager.snapshot().connection || {}), transport: 'windows-named-pipe', pipe: pipeName, pipeName, endpoint: `\\\\.\\pipe\\${pipeName}`, skillPath: path.join(resourceRoot, 'agent-skill/mediahub'), available: pipeReady, profile: profile ? 'acceptance' : 'production' } }; }
+function snapshot() { return { ...manager.snapshot(), platformUpdates: updates?.snapshot() || { status: 'unavailable', currentVersion: app.getVersion(), error: '开发模式未启用平台升级' }, connection: { ...(manager.snapshot().connection || {}), transport: 'windows-named-pipe', pipe: pipeName, pipeName, endpoint: `\\\\.\\pipe\\${pipeName}`, skillPath: path.join(resourceRoot, 'agent-skill/mediahub'), available: pipeReady && ready, profile: profile ? 'acceptance' : 'production' } }; }
 function changed() { if (ready && pipeReady) updates?.markReady(); if (window && !window.isDestroyed() && ready) window.webContents.send('mediahub:changed', snapshot()); maybeFinishQuit(); }
 function busyTasks() { return manager?.snapshot().tasks.filter(t => ['queued', 'running', 'cancelling'].includes(t.state)) || []; }
 function busyOperations() { return manager?.snapshot().operations?.filter(o => ['queued', 'running', 'downloading', 'installing', 'verifying', 'starting'].includes(o.state || o.status)) || []; }
@@ -351,8 +351,12 @@ else {
       } });
       updates.on('changed', changed);
     }
-    await setupWindow(); setupTray();
+    if (quitting) return;
+    await setupWindow(); if (quitting) return; setupTray();
     manager.call('tools.list', { refresh: true }).catch(error => log('catalog', error.message));
     if (updates) updates.call('check').catch(error => log('update', error.message));
-  }).catch(error => { log('fatal', error.stack); dialog.showErrorBox('MediaHub 启动失败', error.message); quitting = true; app.quit(); });
+  }).catch(error => {
+    if (quitting) { log('startup-cancelled', error.message); app.quit(); return; }
+    log('fatal', error.stack); dialog.showErrorBox('MediaHub 启动失败', error.message); quitting = true; app.quit();
+  });
 }
