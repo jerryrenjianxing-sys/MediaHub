@@ -154,7 +154,7 @@ export class HyperframesAdapter {
     return task;
     } finally { this.renderStarting=false; }
   }
-  async render(params) { const task=await this.startTask(params); return {accepted:true,taskId:task.id,status:task.status,outputPath:task.outputPath}; }
+  async render(params) { const task=await this.startTask({...params,source:'agent'}); return {accepted:true,taskId:task.id,status:task.status,outputPath:task.outputPath}; }
   async execute(task,quality,composition,variables) {
     try {
       const lint=await this.lint({projectDir:task.projectDir}); if (!lint.ok) throw error('LINT_FAILED',`静态检查发现 ${lint.totalErrors} 个错误。`);
@@ -200,7 +200,7 @@ export class HyperframesAdapter {
   async startServers() {
     const preview=new Hono();
     preview.use('*',async(c,next)=>{ if(c.req.header('host')!==`127.0.0.1:${this.previewPort}`)return c.text('Invalid host',403);c.header('Content-Security-Policy',`default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors ${this.studioOrigin}`);c.header('X-Content-Type-Options','nosniff');c.header('Referrer-Policy','no-referrer');await next();});
-    preview.get('/p/:id/preview',async c=>{const project=this.projects.get(c.req.param('id'));if(!project)return c.text('Not found',404);let html=await bundleToSingleHtml(project.dir,{inlineAssets:true,runtime:'inline',stampHfIds:false});
+    preview.get('/p/:id/preview',async c=>{const project=this.projects.get(c.req.param('id'));if(!project)return c.text('Not found',404);let html=await bundleToSingleHtml(project.dir,{inlineAssets:false,runtime:'inline',stampHfIds:false});
       html=html.replace(/<head([^>]*)>/i,`<head$1><base href="/p/${project.id}/files/">`);
       // The preview knows only the parent's origin, never its instance token or cookie.
       const bridge=`<script>addEventListener('message',e=>{if(e.source!==parent||e.origin!==${JSON.stringify(this.studioOrigin)}||e.data?.source!=='mediahub-studio')return;const h=window.__player;if(e.data.action==='seek')h?.seek(e.data.time);if(e.data.action==='play')h?.play();if(e.data.action==='pause')h?.pause();});const readyTimer=setInterval(()=>{if(window.__playerReady&&window.__player){clearInterval(readyTimer);parent.postMessage({source:'mediahub-preview',type:'ready'},${JSON.stringify(this.studioOrigin)});}},25);setTimeout(()=>clearInterval(readyTimer),30000);</script>`;
@@ -233,7 +233,10 @@ export class HyperframesAdapter {
     studio.route('/api',createStudioApi(studioAdapter));
     const s=await listen(studio);this.studioServer=s.server;this.studioPort=s.port;this.studioOrigin=`http://localhost:${s.port}`;
   }
-  async shutdown() {
+  async shutdown({idleOnly=false}={}) {
+    // This check and the closed flag are synchronous: a competing startTask
+    // either owns the render reservation or observes the closed flag.
+    if(idleOnly && (this.activeTask || this.renderStarting))throw error('TOOL_BUSY','已有视频正在导出或等待导出，暂时不能更新、卸载或停止工具。');
     if(this.shutdownPromise)return this.shutdownPromise;
     this.closed=true;this.shutdownPromise=(async()=>{if(this.activeTask)await this.cancel({taskId:this.activeTask});await Promise.allSettled([...this.browserLaunches]);await Promise.allSettled([...this.browsers].map(browser=>browser.close()));this.browsers.clear();for(const watcher of this.watchers.values())watcher.close();this.watchers.clear();await Promise.all([closeServer(this.studioServer),closeServer(this.previewServer)]);return {stopped:true};})();return this.shutdownPromise;
   }

@@ -8,7 +8,7 @@ const repo=path.resolve(__dirname,'..');
 const runtimePresent=existsSync(path.join(repo,'tools','hyperframes','stage','runtime','node','node.exe'));
 const modulePromise=import(pathToFileURL(path.join(repo,'tools','hyperframes','adapter.mjs')));
 async function fixture(t){const{HyperframesAdapter}=await modulePromise;await fs.mkdir(path.join(repo,'work'),{recursive:true});const root=await fs.mkdtemp(path.join(repo,'work','HF 测试 '));const events=[];const adapter=new HyperframesAdapter({onEvent:e=>events.push(e)});t.after(()=>adapter.shutdown());return {root,adapter,events};}
-const waitFor=async(predicate,timeout=90000)=>{const started=Date.now();while(!predicate()){if(Date.now()-started>timeout)throw Error('Timed out');await new Promise(r=>setTimeout(r,100));}};
+const waitFor=async(predicate,timeout=90000)=>{const started=Date.now();while(!await predicate()){if(Date.now()-started>timeout)throw Error('Timed out');await new Promise(r=>setTimeout(r,100));}};
 
 test('unknown method and missing runtime fail clearly',async t=>{const{HyperframesAdapter}=await modulePromise;const adapter=new HyperframesAdapter({runtime:{node:'missing',chrome:'missing',ffmpeg:'missing',ffprobe:'missing',font:'missing'}});t.after(()=>adapter.shutdown());await assert.rejects(adapter.dispatch('shell',{command:'anything'}),{code:'UNKNOWN_METHOD'});assert.equal((await adapter.status()).healthy,false);await assert.rejects(adapter.create({projectDir:path.join(repo,'work','uncreated')}),{code:'RUNTIME_MISSING'});});
 
@@ -36,9 +36,19 @@ test('Studio browser playback, source saving, automatic refresh and shared rende
   assert.match(await fs.readFile(path.join(projectDir,'index.html'),'utf8'),/已保存的作品/);
   let source=await fs.readFile(path.join(projectDir,'index.html'),'utf8');await fs.writeFile(path.join(projectDir,'index.html'),source.replaceAll('已保存的作品','Agent 自动刷新'));
   await page.waitForFunction(()=>document.getElementById('source').value.includes('Agent 自动刷新'),{timeout:10000});
-  await getPreview().waitForFunction(()=>document.querySelector('.title').textContent.includes('Agent 自动刷新'));
+  await waitFor(async()=>{try{return await getPreview()?.evaluate(()=>document.querySelector('.title')?.textContent.includes('Agent 自动刷新'));}catch{return false;}},10000);
   await new Promise(r=>setTimeout(r,200));
   await page.screenshot({path:path.join(root,'Studio-desktop.png'),fullPage:true});
   await page.select('#quality','draft');await page.click('#render');await waitFor(()=>events.some(e=>e.event==='task'&&e.source==='studio'&&e.status==='complete'),60000);
   const completed=events.find(e=>e.event==='task'&&e.source==='studio'&&e.status==='complete');assert.equal(completed.projectId,platformId);assert.equal(completed.mediaValidated,true);assert.equal(completed.media.streams[0].height,1920);assert.deepEqual(errors,[]);
+});
+
+test('idleOnly stop never cancels an accepted Studio task and closes before a later start',{skip:!runtimePresent,timeout:90000},async t=>{
+  const {root,adapter}=await fixture(t);const projectDir=path.join(root,'更新与Studio受理竞态');await adapter.create({projectDir,duration:1});
+  const accepted=adapter.startTask({projectDir,taskId:'studio-stop-race',source:'studio',quality:'draft'});
+  await assert.rejects(adapter.dispatch('stop',{idleOnly:true}),{code:'TOOL_BUSY'});
+  const task=await accepted;assert.equal(task.source,'studio');assert.equal(adapter.closed,false);await task.done;assert.equal(task.status,'complete',task.error);
+  assert.equal((await adapter.dispatch('stop',{idleOnly:true})).stopped,true);
+  await assert.rejects(adapter.startTask({projectDir,taskId:'too-late',source:'studio'}),{code:'TOOL_CLOSED'});
+  assert.equal(adapter.tasks.has('too-late'),false);
 });

@@ -44,6 +44,7 @@ class HyperframesClient extends EventEmitter {
         this.emit('progress', message);
       } else if (message.event === 'task') {
         message.status = { complete: 'completed', rendering: 'running', validating: 'running' }[message.status] || message.status;
+        if (['queued', 'running', 'cancelling'].includes(message.status)) this.active.add(message.taskId);
         this.emit('task', message);
         const terminal = ['completed', 'failed', 'cancelled', 'interrupted'].includes(message.status || message.state);
         if (terminal) {
@@ -113,10 +114,10 @@ class HyperframesClient extends EventEmitter {
     if (this.finished.has(taskId)) return Promise.resolve(this.finished.get(taskId));
     return new Promise((resolve, reject) => { this.tasks.set(taskId, { resolve, reject, context }); });
   }
-  async stop() {
+  async stop({ idleOnly = false } = {}) {
     const child = this.child;
     if (!child) return;
-    try { await this.request('shutdown', {}, 180000); } catch (error) { this.log('shutdown', error.message); }
+    try { await this.request('shutdown', { idleOnly }, 180000); } catch (error) { if (idleOnly) throw error; this.log('shutdown', error.message); }
     if (child.exitCode === null) {
       await new Promise((resolve, reject) => {
         const killTimer = setTimeout(() => child.kill(), 5000);

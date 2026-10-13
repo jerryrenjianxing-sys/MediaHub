@@ -102,12 +102,15 @@ async function componentHealth(toolId, context) {
   const status = await hf.start(root);
   if (status?.healthy === false) throw new Error('HyperFrames 健康检查失败');
   // Health check runs in staging and must release its handles before directory activation.
-  await hf.stop();
+  await hf.stop({ idleOnly: true });
   return status;
 }
 async function invokeHyperframes(action, params, context = {}) {
   await hf.start(activeHyperframesRoot());
   const normalized = { ...params, taskId: context.taskId || params.taskId };
+  const project = manager.snapshot().projects.find(p => p.id === params.projectId);
+  if (action === 'create') normalized.title = params.title || project?.name;
+  if (action === 'render') normalized.source = 'agent';
   if (action === 'import' && params.asset) normalized.assets = [{ assetId: params.asset.id, sourcePath: params.asset.path }];
   const result = await hf.invoke(action, normalized, context);
   if (action === 'render') {
@@ -290,13 +293,18 @@ else {
   app.on('before-quit', event => { if (!quitting) { event.preventDefault(); requestQuit().catch(error => log('quit', error.message)); } });
   app.whenReady().then(async () => {
     const catalog = JSON.parse(fs.readFileSync(path.join(resourceRoot, 'resources/catalog.json'), 'utf8'));
-    manager = createManager({ dataRoot, resourceRoot, catalog, version: app.getVersion(), acceptance: !!profile, allowExternalScan: !!profile?.allowExternalScan, workspaceRoot: profile?.workspaceRoot, pipeName, agentClientPath: helperPath, skillPath: path.join(resourceRoot, 'agent-skill/mediahub'), catalogUrl: 'https://raw.githubusercontent.com/jerryrenjianxing-sys/MediaHub/distribution/catalog/catalog.signed.json', catalogPublicKey: fs.readFileSync(path.join(resourceRoot, 'resources/catalog-public.pem'), 'utf8'), onOpenExternalTool: openExternalTool, onInstallExternal: installExternalTool, onInvokeHyperframes: invokeHyperframes, onComponentHealth: componentHealth, onComponentStop: async () => { await closeStudio(); await hf.stop(); }, onComponentBusy: () => hf.busy, onVerifyExternal: (id, executable) => verifyExternal(catalog.tools.find(t => t.id === id), executable), onScanExternal: tool => scanExternal(tool), onArchiveSkill: archiveSkill, onCancelExternalTask: async task => { const response = await hf.request('cancel', { taskId: task.externalId }, 180000); return response; } });
+    manager = createManager({ dataRoot, resourceRoot, catalog, version: app.getVersion(), acceptance: !!profile, allowExternalScan: !!profile?.allowExternalScan, workspaceRoot: profile?.workspaceRoot, pipeName, agentClientPath: helperPath, skillPath: path.join(resourceRoot, 'agent-skill/mediahub'), catalogUrl: 'https://raw.githubusercontent.com/jerryrenjianxing-sys/MediaHub/distribution/catalog/catalog.signed.json', catalogPublicKey: fs.readFileSync(path.join(resourceRoot, 'resources/catalog-public.pem'), 'utf8'), onOpenExternalTool: openExternalTool, onInstallExternal: installExternalTool, onInvokeHyperframes: invokeHyperframes, onComponentHealth: componentHealth, onComponentStop: async () => { await closeStudio(); await hf.stop({ idleOnly: true }); }, onComponentBusy: () => hf.busy, onVerifyExternal: (id, executable) => verifyExternal(catalog.tools.find(t => t.id === id), executable), onScanExternal: tool => scanExternal(tool), onArchiveSkill: archiveSkill, onCancelExternalTask: async task => { const response = await hf.request('cancel', { taskId: task.externalId }, 180000); return response; } });
     await manager.ready; manager.on('changed', changed);
     hf.on('task', async event => {
       if (event.source !== 'studio') return;
       let taskId = externalTasks.get(event.taskId);
       if (!taskId) { taskId = manager.beginExternalTask({ toolId: 'hyperframes', capabilityId: 'hyperframes.render', projectId: event.projectId, externalId: event.taskId }); externalTasks.set(event.taskId, taskId); }
-      await manager.updateExternalTask(taskId, { state: event.status || event.state, progress: { phase: event.stage || 'rendering', percent: Number(event.progress) || 0, message: event.stage || '' }, result: event, error: event.error ? { code: event.errorCode || 'RENDER_FAILED', message: String(event.error) } : null });
+      try { await manager.updateExternalTask(taskId, { state: event.status || event.state, progress: { phase: event.stage || 'rendering', percent: Number(event.progress) || 0, message: event.stage || '' }, result: event, error: event.error ? { code: event.errorCode || 'RENDER_FAILED', message: String(event.error) } : null }); } catch (error) { log('studio-task', error.message); }
+    });
+    hf.on('progress', event => {
+      const taskId = externalTasks.get(event.taskId);
+      if (!taskId) return;
+      try { manager.updateExternalTask(taskId, { state: 'running', progress: { phase: event.stage || 'rendering', percent: Number(event.progress) || 0, message: event.stage || '' } }); } catch (error) { log('studio-progress', error.message); }
     });
     startPipe();
     if (app.isPackaged) {

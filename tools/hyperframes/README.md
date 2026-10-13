@@ -18,7 +18,7 @@ Input and output are UTF-8 NDJSON on stdin/stdout. Requests are `{ "id": "reques
 | render | projectDir; unique taskId; quality draft/standard/high | accepted, taskId, status, proposed outputPath |
 | status | optional taskId/projectDir | runtime health or durable task state |
 | cancel | taskId | stopped=true only after render worker exits |
-| shutdown | — | stopped=true after tasks and servers stop |
+| shutdown / stop | optional idleOnly=true for update/uninstall | Rejects TOOL_BUSY atomically when a render is accepted; otherwise stopped=true after servers stop |
 
 Events: `{event:'progress',taskId,progress,stage}`, `{event:'task',taskId,status,...}` and `{event:'project-changed',projectId}`. Task state includes `source:'agent'|'studio'`, projectId, projectDir, start/end times. Only a successful worker exit followed by bundled ffprobe validation returns `artifact:{path,name,mediaValidated:true,media}`. The platform must persist these events and index only validated artifacts. Interrupted task records are never replayed automatically.
 
@@ -35,3 +35,5 @@ Studio binds to localhost and requires an instance token in an HttpOnly host-onl
 Run `npm ci --ignore-scripts` in this directory; run `node ../../scripts/package-hyperframes.mjs --prepare-only` to prepare the private runtime, then omit the flag to build the independent release archive. Required build inputs: MEDIAHUB_FFMPEG_CACHE (extracted MediaHub source-built binary directory) and MEDIAHUB_FFMPEG_SOURCE (the matching source ZIP). Optional inputs: MEDIAHUB_NODE_CACHE, MEDIAHUB_FFMPEG_SOURCE_SHA256. Runtime hashes are validated and recorded in runtime-lock.json. Immutable ZIP, per-file manifest, sources inventory and SHA256 are emitted to release/.
 
 The distributable uses the MediaHub FFmpeg 8.1.1 source build with exactly two external media libraries, x264 and zlib. It includes licenses, binary checksums, build configuration, fixed source hashes and a complete corresponding-source ZIP containing the original sources, configure logs and build script. Unrelated Gyan full-build binaries are not accepted by the public packaging script.
+
+GSAP is under Webflow's [Standard No Charge GSAP License](https://gsap.com/community/standard-license/), not MIT/Apache. Its published FAQ permits commercial and AI-generated animation code; similar no-code visual animation builders are restricted. This Studio edits source code, and keeps all original GSAP notices. A future complete visual animation builder requires a fresh license review.
