@@ -1,11 +1,16 @@
 {
   "name": "mediahub-hyperframes-tool",
-  "version": "0.1.0-preview.1",
+  "version": "0.1.0-preview.2",
   "private": true,
   "type": "module",
   "license": "MIT",
-  "engines": { "node": "24.21.0" },
-  "scripts": { "test": "node --test ../../tests/hyperframes*.test.cjs", "package": "node ../../scripts/package-hyperframes.mjs" },
+  "engines": {
+    "node": "24.21.0"
+  },
+  "scripts": {
+    "test": "node --test ../../tests/hyperframes*.test.cjs",
+    "package": "node ../../scripts/package-hyperframes.mjs"
+  },
   "dependencies": {
     "@hyperframes/core": "0.8.151",
     "@hyperframes/lint": "0.8.151",

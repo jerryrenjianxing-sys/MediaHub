@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "versions": {
-    "tool": "0.1.0-preview.1",
+    "tool": "0.1.0-preview.2",
     "hyperframes": "0.8.151",
     "node": "24.21.0",
     "chrome": "152.0.7977.30",

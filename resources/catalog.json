@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "generatedAt": "2026-10-13T08:57:57.534Z",
+  "generatedAt": "2026-10-13T09:16:53.212Z",
   "tools": [
     {
       "id": "mediaflow",
@@ -113,7 +113,7 @@
       "id": "hyperframes",
       "name": "HyperFrames",
       "kind": "component",
-      "version": "0.1.0-preview.1",
+      "version": "0.1.0-preview.2",
       "upstreamVersion": "0.8.151",
       "description": "本地 HTML 视频工具包，按需安装 Node、浏览器、FFmpeg、字体与动画依赖。支持预览、检查与 MP4 导出。",
       "license": "Apache-2.0; runtime and asset licenses separately listed",
@@ -121,19 +121,19 @@
       "component": {
         "entry": "service-entry.mjs",
         "node": "runtime/node/node.exe",
-        "manifest": "component-manifest.json"
+        "manifest": "manifest.json"
       },
       "links": {
         "home": "https://github.com/heygen-com/hyperframes",
         "update": "https://github.com/jerryrenjianxing-sys/MediaHub/releases"
       },
       "package": {
-        "url": "https://github.com/jerryrenjianxing-sys/MediaHub/releases/download/hyperframes-v0.1.0-preview.1/MediaHub-HyperFrames-0.1.0-preview.1-win-x64.zip",
-        "fileName": "MediaHub-HyperFrames-0.1.0-preview.1-win-x64.zip",
-        "sha256": "af28dc15dfeaad3d21f6561ab3c5158f380dcbcb302ebf6e9f95feef0087bb43",
-        "bytes": 297034361
+        "url": "https://github.com/jerryrenjianxing-sys/MediaHub/releases/download/hyperframes-v0.1.0-preview.2/MediaHub-HyperFrames-0.1.0-preview.2-win-x64.zip",
+        "fileName": "MediaHub-HyperFrames-0.1.0-preview.2-win-x64.zip",
+        "sha256": "1cd2ded6d268f6aab57b32154e550287245ef59625ce0d918d91d318816533cd",
+        "bytes": 297034364
       }
     }
   ],
-  "sequence": 1791881877535
+  "sequence": 1791883013212
 }
