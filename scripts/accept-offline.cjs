@@ -41,7 +41,8 @@ function ruleGroup(env = process.env) { return `MediaHub Offline Acceptance ${en
 const psQuote = value => `'${String(value).replaceAll("'", "''")}'`;
 async function powershell(script, timeout = 45000) {
   const executable = path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
-  const { stdout } = await exec(executable, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from("$ErrorActionPreference = 'Stop'; " + script, 'utf16le').toString('base64')], { timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
+  const prefix = "$ErrorActionPreference = 'Stop'; [Console]::InputEncoding = [Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); ";
+  const { stdout } = await exec(executable, ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(prefix + script, 'utf16le').toString('base64')], { timeout, windowsHide: true, maxBuffer: 8 * 1024 * 1024 });
   return stdout.trim() ? JSON.parse(stdout) : null;
 }
 async function firewallState() {
@@ -66,7 +67,7 @@ async function installRules(component) {
   }
   const rules = await powershell(`@(Get-NetFirewallRule -Group ${psQuote(group)} | ForEach-Object {[PSCustomObject]@{name=$_.Name;enabled=$_.Enabled.ToString();direction=$_.Direction.ToString();action=$_.Action.ToString();program=($_ | Get-NetFirewallApplicationFilter).Program;remoteAddress=@(($_ | Get-NetFirewallAddressFilter).RemoteAddress)}}) | ConvertTo-Json -Depth 5 -Compress`);
   assert.equal(rules.length, programs.length);
-  for (const rule of rules) { assert.equal(rule.action, 'Block'); assert.equal(rule.direction, 'Outbound'); assert.equal(rule.enabled, 'True'); assert.ok(within(component, rule.program)); }
+  for (const rule of rules) { assert.equal(rule.action, 'Block'); assert.equal(rule.direction, 'Outbound'); assert.equal(rule.enabled, 'True'); assert.ok(typeof rule.program === 'string' && within(component, rule.program), `Firewall program failed package boundary check: ${redact(String(rule.program)).slice(0, 200)}`); }
   return rules;
 }
 async function download(pkg, target) {
