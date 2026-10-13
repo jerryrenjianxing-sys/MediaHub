@@ -25,6 +25,61 @@ function redact(value) {
     .replace(/\bBearer\s+[^\s"']+/gi, 'Bearer [REDACTED]')
     .replace(/\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)/g, '[REDACTED]');
 }
+function scrub(value) {
+  if (typeof value === 'string') return redact(value);
+  if (Array.isArray(value)) return value.map(scrub);
+  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, scrub(item)]));
+  return value;
+}
+function writeBoundedRaw(file, value, maxBytes = 2 * 1024 * 1024) {
+  const safe = scrub(value); const serialized = JSON.stringify(safe);
+  if (Buffer.byteLength(serialized) <= maxBytes) atomicJson(file, safe);
+  else atomicJson(file, { truncated: true, originalBytes: Buffer.byteLength(serialized), tail: serialized.slice(-Math.floor(maxBytes / 4)) });
+}
+const runtimeName = /^(node|chrome-headless-shell|ffmpeg|ffprobe)\.exe$/i;
+// A missing CIM path is immediately rechecked in the same sample. DateTime ticks
+// are compared at CIM's microsecond precision, without changing token privileges.
+function processSnapshotScript() {
+  return `$rows = @(foreach ($cim in @(Get-CimInstance Win32_Process)) {
+    $created = if ($null -ne $cim.CreationDate) {$cim.CreationDate.ToUniversalTime()} else {$null};
+    $row = [ordered]@{ProcessId=$cim.ProcessId;ParentProcessId=$cim.ParentProcessId;Name=$cim.Name;ExecutablePath=$cim.ExecutablePath;CreationDate=if($created){$created.ToString('o')}else{$null};PathState='cim';RecheckCreationDate=$null;AliveAtRecheck=$null;RecheckError=$null};
+    if ($cim.Name -match '^(node|chrome-headless-shell|ffmpeg|ffprobe)\\.exe$' -and [string]::IsNullOrWhiteSpace($row.ExecutablePath)) {
+      $live = Get-Process -Id $cim.ProcessId -ErrorAction SilentlyContinue;
+      if ($null -eq $live) {$row.PathState='unknownExited';$row.AliveAtRecheck=$false;$row.RecheckError='pid-no-longer-present'}
+      else {try {
+        $start = $live.StartTime.ToUniversalTime(); $row.RecheckCreationDate=$start.ToString('o');
+        if ($null -eq $created) {$row.PathState='unknownAlive';$row.AliveAtRecheck=$true;$row.RecheckError='cim-creation-time-unavailable'}
+        elseif ([Math]::Abs($start.Ticks-$created.Ticks) -ge 10) {$row.PathState='unknownExited';$row.AliveAtRecheck=$false;$row.RecheckError='pid-instance-changed'}
+        elseif ($live.HasExited) {$row.PathState='unknownExited';$row.AliveAtRecheck=$false;$row.RecheckError='same-instance-exited'}
+        else {$candidate=$live.Path; if(-not [string]::IsNullOrWhiteSpace($candidate)) {$row.ExecutablePath=$candidate;$row.PathState='get-process';$row.AliveAtRecheck=$true}
+          elseif($live.HasExited) {$row.PathState='unknownExited';$row.AliveAtRecheck=$false;$row.RecheckError='exited-during-path-read'}
+          else {$row.PathState='unknownAlive';$row.AliveAtRecheck=$true;$row.RecheckError='live-path-unavailable'} }
+      } catch {
+        $again = Get-Process -Id $cim.ProcessId -ErrorAction SilentlyContinue;
+        if($null -eq $again) {$row.PathState='unknownExited';$row.AliveAtRecheck=$false;$row.RecheckError='exited-during-recheck'}
+        else {$row.PathState='unknownAlive';$row.AliveAtRecheck=$true;$row.RecheckError=$_.FullyQualifiedErrorId}
+      }}
+    }; [PSCustomObject]$row
+  }); $rows | ConvertTo-Json -Depth 5 -Compress`;
+}
+function mergeObservation(seen, row) {
+  const key = `${row.ProcessId}|${row.CreationDate || '<creation-unavailable>'}`;
+  const previous = seen.get(key);
+  // Only this same PID+creation instance may reuse an earlier observed path.
+  if (!row.ExecutablePath && previous?.ExecutablePath) seen.set(key, { ...row, ExecutablePath: previous.ExecutablePath, LastObservationState: row.PathState, PathState: 'same-instance-history', PathObservedAt: previous.PathObservedAt });
+  else seen.set(key, { ...row, PathObservedAt: row.ExecutablePath ? new Date().toISOString() : null });
+}
+function classifyObservations(rows, component) {
+  const summary = { verified: 0, unknownExited: 0, unknownAlive: 0, outside: 0, verifiedRuntimeNames: [] };
+  const verifiedNames = new Set(); const observed = rows.map(row => {
+    if (!runtimeName.test(row.Name)) return { name: row.Name, creationDate: row.CreationDate, state: 'support-process', packaged: row.ExecutablePath ? within(component, row.ExecutablePath) : null };
+    let state;
+    if (row.ExecutablePath) { state = !within(component, row.ExecutablePath) ? 'outside' : row.CreationDate ? 'verified' : 'unknownAlive'; }
+    else state = row.PathState === 'unknownExited' ? 'unknownExited' : 'unknownAlive';
+    summary[state]++; if (state === 'verified') verifiedNames.add(row.Name.toLowerCase());
+    return { name: row.Name, creationDate: row.CreationDate, state, packaged: state === 'verified' ? true : state === 'outside' ? false : null, pathSource: row.PathState };
+  }); summary.verifiedRuntimeNames = [...verifiedNames].sort(); return { summary, observed };
+}
 
 function assertHostedRunner(env = process.env, platform = process.platform) {
   if (platform !== 'win32' || env.GITHUB_ACTIONS !== 'true' || env.RUNNER_ENVIRONMENT !== 'github-hosted' || env.RUNNER_OS !== 'Windows' || !/^\d+$/.test(env.GITHUB_RUN_ID || '') || !/^\d+$/.test(env.GITHUB_RUN_ATTEMPT || '') || !env.RUNNER_TEMP) {
@@ -101,14 +156,19 @@ async function bundledProcess(config, mode, timeout = 300000) {
   const node = path.join(config.component, 'runtime', 'node', 'node.exe');
   const child = spawn(native, ['job', '--', node, __filename, mode, config.configPath], { cwd: root, env: childEnvironment(), stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   const output = { stdout: '', stderr: '', observed: [], processErrors: [] };
-  const seen = new Map(); let sampling = false;
+  const seen = new Map(); let sampling = false; let wrapperCreationDate = null;
   const sample = async () => {
     if (sampling) return; sampling = true;
     try {
-      const snapshot = await powershell('Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath | ConvertTo-Json -Compress', 20000);
-      const rows = Array.isArray(snapshot) ? snapshot : [snapshot]; const owned = new Set([child.pid]); let changed = true;
+      const snapshot = await powershell(processSnapshotScript(), 20000);
+      const rows = Array.isArray(snapshot) ? snapshot : [snapshot];
+      const wrapper = rows.find(row => row.ProcessId === child.pid);
+      if (!wrapper || wrapper.Name?.toLowerCase() !== 'mediahub-pipe.exe' || !wrapper.CreationDate) return;
+      if (wrapperCreationDate && wrapper.CreationDate !== wrapperCreationDate) return;
+      wrapperCreationDate ||= wrapper.CreationDate;
+      const owned = new Set([child.pid]); let changed = true;
       while (changed) { changed = false; for (const row of rows) if (owned.has(row.ParentProcessId) && !owned.has(row.ProcessId)) { owned.add(row.ProcessId); changed = true; } }
-      for (const row of rows) if (owned.has(row.ProcessId)) seen.set(row.ProcessId, row);
+      for (const row of rows) if (owned.has(row.ProcessId)) mergeObservation(seen, row);
     } catch (error) { output.processErrors.push(error.message); } finally { sampling = false; }
   };
   const interval = setInterval(() => void sample(), 1250); void sample();
@@ -119,11 +179,17 @@ async function bundledProcess(config, mode, timeout = 300000) {
     output.exitCode = await new Promise((resolve, reject) => { child.once('error', reject); child.once('close', resolve); });
   } finally { clearTimeout(timer); clearInterval(interval); child.kill('SIGKILL'); while (sampling) await pause(25); }
   output.observed = [...seen.values()];
-  for (const row of output.observed) if (/^(node|chrome-headless-shell|ffmpeg|ffprobe)\.exe$/i.test(row.Name)) assert.ok(row.ExecutablePath && within(config.component, row.ExecutablePath), `An owned media runtime escaped the package: ${row.Name}`);
-  atomicJson(path.join(root, `${mode.slice(2)}.raw.json`), { ...output, stderr: redact(output.stderr), processErrors: output.processErrors.map(redact) });
-  assert.equal(output.exitCode, 0, `Bundled ${mode} failed: ${redact(output.stderr.slice(-4000))}`);
-  const lines = output.stdout.trim().split(/\r?\n/).filter(Boolean); const result = JSON.parse(lines.at(-1));
-  return { result, observed: output.observed.map(row => ({ name: row.Name, packaged: row.ExecutablePath ? within(config.component, row.ExecutablePath) : null })) };
+  const evidence = classifyObservations(output.observed, config.component); output.processSummary = evidence.summary;
+  // Preserve actual child diagnostics before any gate can reject the evidence.
+  writeBoundedRaw(path.join(root, `${mode.slice(2)}.raw.json`), output);
+  try {
+    assert.equal(output.exitCode, 0, `Bundled ${mode} failed: ${redact(output.stderr.slice(-4000))}`);
+    assert.equal(evidence.summary.outside, 0, 'An observed media runtime has a real path outside the package or lacks creation identity');
+    assert.equal(evidence.summary.unknownAlive, 0, 'A still-live media runtime path could not be verified after immediate recheck');
+    if (mode === '--isolated-stage') for (const name of ['node.exe', 'chrome-headless-shell.exe']) assert.ok(evidence.summary.verifiedRuntimeNames.includes(name), `No actual verified ${name} process sample was captured`);
+    const lines = output.stdout.trim().split(/\r?\n/).filter(Boolean); const result = JSON.parse(lines.at(-1));
+    return { result, ...evidence };
+  } catch (error) { error.runtimeProcessSummary = evidence.summary; error.runtimeProcessEvidence = evidence.observed; throw error; }
 }
 async function tcpProbe(address, timeout = 8000) {
   return new Promise(resolve => {
@@ -138,23 +204,42 @@ async function configFrom(file) {
   config.component = fs.realpathSync(config.component); assert.ok(within(root, config.component)); assert.equal(fs.realpathSync(process.execPath), fs.realpathSync(path.join(config.component, 'runtime', 'node', 'node.exe'))); assert.equal(process.version, 'v24.21.0'); assert.equal(process.env.PATH.toLowerCase(), path.join(process.env.SystemRoot, 'System32').toLowerCase()); assert.equal(net.isIP(config.externalAddress), 4);
   return config;
 }
+async function browserRuntime(config) {
+  const { default: puppeteer } = await import(pathToFileURL(path.join(config.component, 'node_modules', 'puppeteer-core', 'lib', 'puppeteer', 'puppeteer-core.js')));
+  return puppeteer.launch({ executablePath: path.join(config.component, 'runtime', 'chrome', 'chrome-headless-shell.exe'), headless: true, args: ['--disable-gpu', '--disable-background-networking', '--no-first-run', '--no-proxy-server'] });
+}
+async function chromeProbe(browser, mustLoad) {
+  const page = await browser.newPage(); let response; let failure;
+  try {
+    await page.setCacheEnabled(false);
+    try { response = await page.goto('https://github.com/', { waitUntil: 'domcontentloaded', timeout: mustLoad ? 30000 : 12000 }); } catch (error) { failure = error.message; }
+    if (mustLoad) { assert.ok(!failure && response && response.ok(), `Bundled Chrome public baseline failed: ${redact(failure || `HTTP ${response?.status()}`)}`); return { loaded: true, status: response.status(), origin: 'https://github.com' }; }
+    assert.ok(failure, 'Bundled Chrome unexpectedly loaded an external page');
+    return { loaded: false, reason: redact(failure).replace(/https?:\/\/[^\s]+/g, '[external-url]').slice(0, 200) };
+  } finally { await page.close(); }
+}
+async function baselineStage(config) {
+  const node = await tcpProbe(config.externalAddress); assert.equal(node.connected, true, 'Bundled Node must reach the public TCP endpoint before isolation');
+  const browser = await browserRuntime(config);
+  try { return { node, chrome: await chromeProbe(browser, true) }; } finally { await browser.close(); }
+}
 async function isolatedStage(config) {
   const tests = []; const events = []; const pending = new Map(); let nextId = 0;
   const node = path.join(config.component, 'runtime', 'node', 'node.exe'); const chrome = path.join(config.component, 'runtime', 'chrome', 'chrome-headless-shell.exe'); const ffprobe = path.join(config.component, 'runtime', 'ffmpeg', 'ffprobe.exe');
   const nodeBlocked = await tcpProbe(config.externalAddress); assert.equal(nodeBlocked.connected, false, 'The bundled Node still has external TCP access'); tests.push({ name: 'actual-node-network-block', passed: true, reason: nodeBlocked.reason });
-  const { default: puppeteer } = await import(pathToFileURL(path.join(config.component, 'node_modules', 'puppeteer-core', 'lib', 'puppeteer', 'puppeteer-core.js')));
-  const browser = await puppeteer.launch({ executablePath: chrome, headless: true, args: ['--disable-gpu', '--disable-background-networking', '--no-first-run', '--no-proxy-server'] });
+  const manifest = JSON.parse(await fsp.readFile(path.join(config.component, 'manifest.json'), 'utf8'));
+  const probeBinary = manifest.files.find(file => file.path === 'runtime/ffmpeg/ffprobe.exe'); assert.ok(probeBinary && /^[a-f0-9]{64}$/.test(probeBinary.sha256));
+  const probeHash = await sha256(ffprobe); assert.equal(probeHash, probeBinary.sha256, 'Actual ffprobe binary does not match the verified package manifest');
+  const browser = await browserRuntime(config);
   let service; let stderr = '';
   try {
-    const externalPage = await browser.newPage(); let remoteFailure;
-    try { await externalPage.goto('https://github.com/', { waitUntil: 'domcontentloaded', timeout: 12000 }); } catch (error) { remoteFailure = error.message; }
-    assert.ok(remoteFailure, 'Bundled Chrome unexpectedly loaded an external page'); await externalPage.close(); tests.push({ name: 'actual-chrome-network-block', passed: true, reason: remoteFailure.replace(/https?:\/\/[^\s]+/g, '[external-url]').slice(0, 200) });
+    const chromeBlocked = await chromeProbe(browser, false); tests.push({ name: 'actual-chrome-network-block', passed: true, reason: chromeBlocked.reason });
     service = spawn(path.join(config.component, 'runtime', 'native', 'mediahub-pipe.exe'), ['job', '--', node, path.join(config.component, 'service-entry.mjs')], { cwd: config.component, env: childEnvironment(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
     const failPending = error => { for (const entry of pending.values()) { clearTimeout(entry.timer); entry.reject(error); } pending.clear(); };
     service.on('error', failPending); service.on('exit', code => failPending(new Error(`Adapter exited (${code}): ${stderr.slice(-1000)}`))); service.stdin.on('error', failPending); service.stderr.on('data', chunk => { stderr = (stderr + chunk).slice(-32000); });
     readline.createInterface({ input: service.stdout }).on('line', line => {
       let value; try { value = JSON.parse(line); } catch { return failPending(new Error('Adapter protocol was not valid NDJSON')); }
-      if (value.event) { events.push(value); return; } const entry = pending.get(value.id); if (!entry) return; pending.delete(value.id); clearTimeout(entry.timer); value.error ? entry.reject(Object.assign(new Error(value.error.message), value.error)) : entry.resolve(value.result);
+      if (value.event) { events.push(value); if (events.length > 2000) events.shift(); return; } const entry = pending.get(value.id); if (!entry) return; pending.delete(value.id); clearTimeout(entry.timer); value.error ? entry.reject(Object.assign(new Error(value.error.message), value.error)) : entry.resolve(value.result);
     });
     const call = (method, params = {}, timeout = 90000) => new Promise((resolve, reject) => { const id = `offline-${++nextId}`; const timer = setTimeout(() => { pending.delete(id); reject(new Error(`Adapter timed out: ${method}`)); }, timeout); pending.set(id, { resolve, reject, timer }); service.stdin.write(JSON.stringify({ id, method, params }) + '\n'); });
     const status = await call('status'); assert.equal(status.healthy, true); assert.equal(status.versions.node, '24.21.0'); assert.equal(status.versions.chrome, '152.0.7977.30'); assert.equal(status.versions.ffmpeg, '8.1.1');
@@ -181,21 +266,24 @@ async function isolatedStage(config) {
       const end = Date.now() + 120000; let task;
       do { await pause(250); task = await call('status', { taskId }); } while (['queued', 'rendering', 'validating'].includes(task.status) && Date.now() < end);
       assert.equal(task.status, 'complete', task.error); assert.equal(task.mediaValidated, true); assert.equal(task.artifact.mediaValidated, true); assert.ok(events.some(event => event.event === 'progress' && event.taskId === taskId)); assert.ok(fs.statSync(task.outputPath).size > 1000);
+      assert.equal(await sha256(ffprobe), probeHash, 'Bundled ffprobe changed before explicit validation');
+      const probeStartedAt = new Date().toISOString();
       const { stdout } = await exec(ffprobe, ['-v', 'error', '-show_format', '-show_streams', '-of', 'json', task.outputPath], { env: childEnvironment(), windowsHide: true, timeout: 30000, maxBuffer: 1024 * 1024 }); const media = JSON.parse(stdout); const video = media.streams.find(stream => stream.codec_type === 'video');
       assert.equal(video.codec_name, 'h264'); assert.equal(video.width, orientation === 'landscape' ? 1920 : 1080); assert.equal(video.height, orientation === 'landscape' ? 1080 : 1920); assert.equal(video.avg_frame_rate, '30/1'); assert.ok(['yuv420p', 'yuvj420p'].includes(video.pix_fmt)); assert.ok(Number(media.format.duration) > 0);
-      renders.push({ orientation, width: video.width, height: video.height, codec: video.codec_name, pixelFormat: video.pix_fmt, fps: video.avg_frame_rate, duration: Number(media.format.duration), bytes: fs.statSync(task.outputPath).size, sha256: await sha256(task.outputPath), sourceAssetIdPreserved: true, structuredProgress: true, mediaValidated: true });
+      renders.push({ orientation, width: video.width, height: video.height, codec: video.codec_name, pixelFormat: video.pix_fmt, fps: video.avg_frame_rate, duration: Number(media.format.duration), bytes: fs.statSync(task.outputPath).size, sha256: await sha256(task.outputPath), sourceAssetIdPreserved: true, structuredProgress: true, mediaValidated: true, ffprobeReceipt: { binary: 'runtime/ffmpeg/ffprobe.exe', manifestSha256: probeBinary.sha256, actualSha256: probeHash, exitCode: 0, startedAt: probeStartedAt, completedAt: new Date().toISOString(), execution: 'execFile with the verified absolute bundled executable; receipt exists only after successful process exit' } });
       tests.push({ name: `offline-${orientation}-create-preview-agent-refresh-lint-browser-check-render-ffprobe`, passed: true });
     }
-    assert.equal((await tcpProbe(config.externalAddress)).connected, false, 'Isolation disappeared during rendering');
+    const nodeAfter = await tcpProbe(config.externalAddress); assert.equal(nodeAfter.connected, false, 'Node isolation disappeared during rendering'); tests.push({ name: 'actual-node-network-block-after-render', passed: true, reason: nodeAfter.reason });
+    const chromeAfter = await chromeProbe(browser, false); tests.push({ name: 'actual-chrome-network-block-after-render', passed: true, reason: chromeAfter.reason });
     await call('shutdown', { idleOnly: true }); await new Promise(resolve => service.exitCode !== null ? resolve() : service.once('close', resolve)); service = null;
     return { passed: true, tests, renders, networkIsolationRechecked: true, initialPath: 'Windows System32 only; adapter subsequently adds only its bundled Node/FFmpeg directories', protocol: 'native job wrapper + bundled Node service-entry.mjs; UTF-8 NDJSON RPC and structured progress events' };
-  } finally { if (service) service.kill('SIGKILL'); await browser.close(); }
+  } finally { writeBoundedRaw(path.join(root, 'stage-protocol.raw.json'), { events, stderr, tests }); if (service) service.kill('SIGKILL'); await browser.close(); }
 }
 async function main() {
   assertHostedRunner();
   if (process.argv[2] === '--cleanup') { process.stdout.write(JSON.stringify(await removeRules()) + '\n'); return; }
   if (process.argv[2] === '--baseline' || process.argv[2] === '--isolated-stage') {
-    const config = await configFrom(process.argv[3]); const result = process.argv[2] === '--baseline' ? await tcpProbe(config.externalAddress) : await isolatedStage(config); process.stdout.write(JSON.stringify(result) + '\n'); return;
+    const config = await configFrom(process.argv[3]); const result = process.argv[2] === '--baseline' ? await baselineStage(config) : await isolatedStage(config); process.stdout.write(JSON.stringify(result) + '\n'); return;
   }
   const pkg = acceptedPackage(process.env.MEDIAHUB_COMPONENT_URL, process.env.MEDIAHUB_COMPONENT_SHA256);
   if (fs.existsSync(root)) throw new Error('Acceptance requires a fresh work/offline-acceptance directory in a new disposable runner.');
@@ -209,11 +297,13 @@ async function main() {
     const archive = path.join(root, 'component.zip'); report.component.bytes = await download(pkg, archive); const component = path.join(root, '组件 中文 空格');
     await require('../desktop/core/packages.cjs').extractZip(archive, component); const manifest = await verifyManifest(component, pkg.version); report.component.manifestFilesVerified = manifest.files.length;
     const { address } = await dns.lookup('github.com', { family: 4 }); const config = { component, configPath: path.join(root, 'config.json'), externalAddress: address }; atomicJson(config.configPath, config);
-    const baseline = await bundledProcess(config, '--baseline', 45000); assert.equal(baseline.result.connected, true, 'The same bundled Node must reach the public TCP endpoint before isolation'); report.tests.push({ name: 'public-network-baseline-before-rules', passed: true });
+    const baseline = await bundledProcess(config, '--baseline', 90000); assert.equal(baseline.result.node.connected, true); assert.equal(baseline.result.chrome.loaded, true); report.networkBaseline = baseline.result; report.tests.push({ name: 'public-node-and-chrome-network-baseline-before-rules', passed: true });
     rulesCreated = true; const rules = await installRules(component); report.isolation.rules = rules.map(rule => ({ program: path.relative(component, rule.program).replaceAll('\\', '/'), action: rule.action, direction: rule.direction, remoteAddress: rule.remoteAddress }));
-    const isolated = await bundledProcess(config, '--isolated-stage', 420000); report.tests.push(...isolated.result.tests); report.renders = isolated.result.renders; report.isolation.recheckedAfterRender = isolated.result.networkIsolationRechecked; report.runtimeProcesses = isolated.observed; report.runtimeProcessesOutsidePackage = isolated.observed.filter(row => /^(node|chrome-headless-shell|ffmpeg|ffprobe)\.exe$/i.test(row.name) && !row.packaged).length; assert.equal(report.runtimeProcessesOutsidePackage, 0);
+    const isolated = await bundledProcess(config, '--isolated-stage', 420000); assert.equal(isolated.result.passed, true); assert.equal(isolated.result.renders.length, 2); assert.equal(isolated.result.networkIsolationRechecked, true); report.tests.push(...isolated.result.tests); report.renders = isolated.result.renders; report.isolation.recheckedAfterRender = isolated.result.networkIsolationRechecked; report.runtimeProcesses = isolated.observed; report.runtimeProcessSummary = isolated.summary; report.runtimeProcessesOutsidePackage = isolated.summary.outside; report.runtimeProcessesUnknownExited = isolated.summary.unknownExited; report.runtimeProcessesUnknownAlive = isolated.summary.unknownAlive; assert.equal(report.runtimeProcessesOutsidePackage, 0); assert.equal(report.runtimeProcessesUnknownAlive, 0);
+    if (isolated.summary.unknownExited) report.limits.push('Some short-lived runtime instances exited before their image paths could be queried; these samples are listed as unknownExited, not verified. The two explicit bundled FFprobe executions have independently checked binary hashes and successful exit receipts.');
     report.passed = true;
   } catch (error) {
+    if (error.runtimeProcessSummary) { report.runtimeProcessSummary = error.runtimeProcessSummary; report.runtimeProcesses = error.runtimeProcessEvidence; report.runtimeProcessesOutsidePackage = error.runtimeProcessSummary.outside; report.runtimeProcessesUnknownExited = error.runtimeProcessSummary.unknownExited; report.runtimeProcessesUnknownAlive = error.runtimeProcessSummary.unknownAlive; }
     report.error = { code: error.code || error.name, message: redact(error.message).slice(0, 3000) }; throw error;
   } finally {
     try { if (rulesCreated) { report.cleanup = await removeRules(); assert.equal(report.cleanup.remaining, 0, 'Temporary firewall rules remain'); } else report.cleanup = { removed: 0, remaining: 0 }; report.firewallAfter = await firewallState(); assert.deepEqual(report.firewallAfter, before, 'Firewall service/profile/default policy changed during acceptance'); }
@@ -222,5 +312,5 @@ async function main() {
     process.stdout.write(JSON.stringify({ passed: report.passed, tests: report.tests.length, cleanup: report.cleanup, report: 'work/offline-acceptance/report.public.json' }) + '\n');
   }
 }
-module.exports = { assertHostedRunner, acceptedPackage, ruleGroup };
+module.exports = { assertHostedRunner, acceptedPackage, ruleGroup, processSnapshotScript, mergeObservation, classifyObservations };
 if (require.main === module) main().catch(error => { process.stderr.write(redact(error.stack || error) + '\n'); process.exitCode = 1; });
