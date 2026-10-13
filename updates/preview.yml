@@ -1,0 +1,8 @@
+version: 0.1.0-preview.1
+files:
+  - url: https://github.com/jerryrenjianxing-sys/MediaHub/releases/download/v0.1.0-preview.1/MediaHub-0.1.0-preview.1-win-x64-Setup.exe
+    sha512: O6b8qB2yw8xr38DOYy1R9ALJA6pIsFcpS+ub3zPI/RjTIF/B2PYSWzjUJV1AIIO5bWmOpK+AUwoSEjqF3q6gog==
+    size: 121507693
+path: https://github.com/jerryrenjianxing-sys/MediaHub/releases/download/v0.1.0-preview.1/MediaHub-0.1.0-preview.1-win-x64-Setup.exe
+sha512: O6b8qB2yw8xr38DOYy1R9ALJA6pIsFcpS+ub3zPI/RjTIF/B2PYSWzjUJV1AIIO5bWmOpK+AUwoSEjqF3q6gog==
+releaseDate: '2026-10-13T09:03:11.023Z'
