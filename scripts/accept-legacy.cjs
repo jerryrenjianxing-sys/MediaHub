@@ -62,9 +62,12 @@ async function main() {
   process.env.MEDIAWORKBENCH_INSTANCE = path.join(originalProfilesRoot, 'media-deep-researcher', 'instance.json');
   process.env.EASEL_DESKTOP_DATA = path.join(originalProfilesRoot, 'mediasail');
   const catalog = JSON.parse(fs.readFileSync(path.join(repoRoot, 'resources', 'catalog.json'), 'utf8'));
-  const externalTools = catalog.tools.filter(tool => tool.kind === 'external');
-  assert.equal(externalTools.length, 3, 'Expected the three approved original tools');
-  const report = { schema: 2, startedAt: new Date().toISOString(), completedAt: null, passed: false, profile: 'disposable-github-hosted-windows', run: { id: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, sha: process.env.GITHUB_SHA }, isolationRoot: acceptanceRoot, tests: [], tools: [], limits: ['Installation, identity, first opening and original-management handoff only; no business workflow, account login, update installation or actual uninstall is performed.'] };
+  const approvedExternalTools = catalog.tools.filter(tool => tool.kind === 'external');
+  assert.equal(approvedExternalTools.length, 3, 'Expected the three approved original tools');
+  const selectedTool = process.env.MEDIAHUB_LEGACY_TOOL || 'all';
+  assert.ok(selectedTool === 'all' || approvedExternalTools.some(tool => tool.id === selectedTool), 'Unknown requested acceptance tool');
+  const externalTools = selectedTool === 'all' ? approvedExternalTools : approvedExternalTools.filter(tool => tool.id === selectedTool);
+  const report = { schema: 3, startedAt: new Date().toISOString(), completedAt: null, passed: false, profile: 'disposable-github-hosted-windows', selectedTool, fullThreeToolAcceptance: externalTools.length === 3, run: { id: process.env.GITHUB_RUN_ID, attempt: process.env.GITHUB_RUN_ATTEMPT, sha: process.env.GITHUB_SHA }, isolationRoot: acceptanceRoot, tests: [], tools: [], limits: ['Installation, identity, first opening and original-management handoff only; no business workflow, account login, update installation or actual uninstall is performed.'] };
   let manager;
   const startedTools = new Set();
   const saveReport = () => atomicJson(path.join(acceptanceRoot, 'report.json'), report);
@@ -76,7 +79,7 @@ async function main() {
     try { diagnostics.observedInstallation = await findInstalled(tool, destination); } catch (error) { diagnostics.identityError = error.message; }
     const parent = path.dirname(destination);
     if (fs.existsSync(parent)) for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
-      if (!entry.isDirectory() || entry.isSymbolicLink() || !entry.name.startsWith(path.basename(destination) + '.candidate-')) continue;
+      if (!entry.isDirectory() || entry.isSymbolicLink() || !['.candidate-', '.failed-'].some(suffix => entry.name.startsWith(path.basename(destination) + suffix))) continue;
       const candidate = path.join(parent, entry.name);
       if (!within(applicationsRoot, candidate)) continue;
       const identity = await findInstalled(tool, candidate);
@@ -113,6 +116,25 @@ async function main() {
       try {
         diagnostics.scheduledTask = await powershellJson("$task=Get-ScheduledTask -TaskName $inputRecord.name -ErrorAction SilentlyContinue;if($task){@{name=$task.TaskName;state=[string]$task.State;principal=@{logonType=[string]$task.Principal.LogonType;runLevel=[string]$task.Principal.RunLevel};actions=@($task.Actions|ForEach-Object{@{execute=$_.Execute;arguments=$_.Arguments}})}|ConvertTo-Json -Depth 5 -Compress}else{'null'}", { name: 'MediaHub CI MediaFlow Acceptance' });
       } catch (error) { diagnostics.scheduledTaskError = error.message; }
+      const failedProgram = diagnostics.candidateDirectories.find(item => item.path.startsWith(destination + '.failed-') && item.identity);
+      if (failedProgram && !diagnostics.observedInstallation) {
+        // The installer has already failed and rolled back. Re-run only its
+        // original NoStart registration helper with a fresh diagnostic profile,
+        // obtaining ErrorRecord line/stack information that NSIS discarded.
+        // This never converts a failed installer receipt into a successful one.
+        const diagnosticRoot = ensureDir(path.join(originalProfilesRoot, 'mediaflow-diagnostic'));
+        const suffix = crypto.randomUUID();
+        const profilePath = path.join(diagnosticRoot, 'profile.json');
+        const diagnosticProfile = { ...JSON.parse(fs.readFileSync(mediaFlowProfilePath, 'utf8')), id: 'mediahub_diagnostic', install_root: failedProgram.path, app_root: path.join(failedProgram.path, 'resources', 'platform'), data_root: path.join(diagnosticRoot, 'data'), task_name: `MediaHub CI Diagnostic ${suffix}`, shortcut_name: `MediaFlow CI Diagnostic ${suffix}`, registry_key: `Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MediaFlow.Acceptance.Diagnostic-${suffix}` };
+        atomicJson(profilePath, diagnosticProfile);
+        const helper = path.join(failedProgram.path, 'resources', 'platform', 'install-mediaflow-background.ps1');
+        diagnostics.registrationProbe = { noBackgroundStart: true, isolatedDiagnosticProfile: profilePath, helperSha256: fs.existsSync(helper) ? await sha256(helper) : null };
+        if (fs.existsSync(helper)) {
+          try {
+            diagnostics.registrationProbe.result = await powershellJson("$result=@{passed=$false;taskRegistered=$false;cleanup=@()};try{& $inputRecord.helper -NoStart -AppRoot $inputRecord.appRoot -LauncherPath $inputRecord.launcher -InstanceProfilePath $inputRecord.profile|Out-Null;$result.passed=$true;$result.taskRegistered=[bool](Get-ScheduledTask -TaskName $inputRecord.task -ErrorAction SilentlyContinue)}catch{$result.error=@{message=$_.Exception.Message;type=$_.Exception.GetType().FullName;hresult=$_.Exception.HResult;fullyQualifiedErrorId=$_.FullyQualifiedErrorId;position=$_.InvocationInfo.PositionMessage;scriptLine=$_.InvocationInfo.ScriptLineNumber;scriptName=$_.InvocationInfo.ScriptName;stack=$_.ScriptStackTrace}}finally{$task=Get-ScheduledTask -TaskName $inputRecord.task -ErrorAction SilentlyContinue;if($task){if((([string]$task.Actions.Execute)+' '+([string]$task.Actions.Arguments)).IndexOf($inputRecord.appRoot,[StringComparison]::OrdinalIgnoreCase)-ge 0){Unregister-ScheduledTask -TaskName $inputRecord.task -Confirm:$false;$result.cleanup+='diagnostic task removed'}};foreach($folder in @([Environment]::GetFolderPath('Desktop'),[Environment]::GetFolderPath('Programs'))){$link=Join-Path $folder ($inputRecord.shortcut+'.lnk');if(Test-Path -LiteralPath $link){Remove-Item -LiteralPath $link -Force;$result.cleanup+='diagnostic shortcut removed'}}};$result|ConvertTo-Json -Depth 5 -Compress", { helper, appRoot: diagnosticProfile.app_root, launcher: failedProgram.identity.installPath, profile: profilePath, task: diagnosticProfile.task_name, shortcut: diagnosticProfile.shortcut_name });
+          } catch (error) { diagnostics.registrationProbe.error = redactLog(error.message); }
+        }
+      }
     }
     result.diagnostics = diagnostics;
     atomicJson(path.join(evidenceRoot, `${tool.id}-installer-diagnostics.json`), diagnostics); saveReport();
@@ -127,17 +149,34 @@ async function main() {
     assert.ok(within(applicationsRoot, installed.installPath), 'Only the isolated original installation may open');
     const result = resultFor(tool.id);
     const launchArgs = tool.id === 'mediaflow' ? [`--instance-profile=${mediaFlowProfilePath}`] : [];
-    const child = spawn(installed.installPath, launchArgs, { cwd: path.dirname(installed.installPath), windowsHide: true, stdio: 'ignore', env: { ...process.env, DO_NOT_TRACK: '1' } });
-    child.once('error', error => { result.launchError = error.message; }); child.unref(); startedTools.add(tool.id);
-    const deadline = Date.now() + 120000;
+    const launchEnv = { ...process.env, DO_NOT_TRACK: '1', ELECTRON_ENABLE_LOGGING: '1' };
+    delete launchEnv.ELECTRON_RUN_AS_NODE;
+    const launchReceipt = { executable: installed.installPath, args: launchArgs, windowsHide: false, clearedElectronRunAsNode: true, spawnedAt: new Date().toISOString(), exitCode: null, exitSignal: null };
+    let launchOutput = '';
+    const child = spawn(installed.installPath, launchArgs, { cwd: path.dirname(installed.installPath), windowsHide: false, stdio: ['ignore', 'pipe', 'pipe'], env: launchEnv });
+    const collect = chunk => { launchOutput = (launchOutput + chunk.toString('utf8')).slice(-256 * 1024); };
+    child.stdout.on('data', collect); child.stderr.on('data', collect);
+    child.once('error', error => { result.launchError = error.message; });
+    child.once('exit', (code, signal) => { launchReceipt.exitCode = code; launchReceipt.exitSignal = signal; launchReceipt.exitedAt = new Date().toISOString(); });
+    child.unref(); startedTools.add(tool.id);
+    const deadline = Date.now() + 240000;
     let observed = [];
     while (Date.now() < deadline) {
       if (result.launchError) throw new Error(result.launchError);
       observed = await processEvidence(installed.installPath);
       if (observed.some(process => Number(process.windowHandle) !== 0)) break;
+      if (launchReceipt.exitedAt && !observed.length) break;
       await pause(1500);
     }
-    const evidence = { action, requestedAt: new Date().toISOString(), spawnedPid: child.pid, processes: observed, processObserved: observed.length > 0, windowObserved: observed.some(process => Number(process.windowHandle) !== 0), actualUninstallExecuted: false, businessActionExecuted: false };
+    const logFile = path.join(logsRoot, `${tool.id}-${action}-launch-output.log`);
+    fs.writeFileSync(logFile, redactLog(launchOutput));
+    const startupLogs = [];
+    const knownLogs = tool.id === 'media-deep-researcher' ? [path.join(process.env.MEDIAWORKBENCH_DATA_DIR, 'logs', 'desktop.log'), path.join(process.env.MEDIAWORKBENCH_DATA_DIR, 'logs', 'host.log')] : tool.id === 'mediasail' ? [path.join(process.env.EASEL_DESKTOP_DATA, 'logs', 'desktop.log'), path.join(process.env.EASEL_DESKTOP_DATA, 'logs', 'updates.log')] : [];
+    for (const file of knownLogs) if (fs.existsSync(file) && fs.statSync(file).isFile()) {
+      const saved = path.join(logsRoot, `${tool.id}-${action}-${path.basename(file)}.redacted.log`);
+      fs.writeFileSync(saved, redactLog(fs.readFileSync(file, 'utf8').slice(-256 * 1024))); startupLogs.push({ source: file, saved });
+    }
+    const evidence = { action, requestedAt: launchReceipt.spawnedAt, completedAt: new Date().toISOString(), launchReceipt, spawnedPid: child.pid, processes: observed, launchLog: logFile, startupLogs, processObserved: observed.length > 0, windowObserved: observed.some(process => Number(process.windowHandle) !== 0), actualUninstallExecuted: false, businessActionExecuted: false };
     result.entries.push(evidence); atomicJson(path.join(evidenceRoot, `${tool.id}-${action}.json`), evidence); saveReport();
     assert.ok(evidence.processObserved, `${tool.name}: no actual original process was observed`);
     assert.ok(evidence.windowObserved, `${tool.name}: first-launch window was not observed; process presence alone does not prove the interface is ready`);
@@ -146,7 +185,12 @@ async function main() {
   async function findInstalled(tool, destination) {
     const expectedNames = (tool.detection?.processNames || []).map(name => name.replace(/\.exe$/i, '') + '.exe');
     const candidates = [];
-    for (const name of expectedNames) candidates.push(path.join(destination, name), path.join(destination, 'current', name));
+    for (const name of expectedNames) {
+      // A Velopack root exe is an execution stub. Observe and import the real
+      // versioned program under current, which owns the Electron window.
+      if (tool.id === 'media-deep-researcher') candidates.push(path.join(destination, 'current', name), path.join(destination, name));
+      else candidates.push(path.join(destination, name), path.join(destination, 'current', name));
+    }
     const walk = (directory, depth = 0) => {
       if (depth > 4 || !fs.existsSync(directory)) return;
       for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {

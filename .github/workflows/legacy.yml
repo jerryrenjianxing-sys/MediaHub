@@ -1,12 +1,25 @@
 name: Original tools clean Windows acceptance
 on:
   workflow_dispatch:
+    inputs:
+      tool:
+        description: 'Run all original tools for delivery, or one tool for focused diagnosis'
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - mediaflow
+          - media-deep-researcher
+          - mediasail
 permissions:
   contents: read
 jobs:
   original-tools:
     runs-on: windows-2025
     timeout-minutes: 120
+    env:
+      MEDIAHUB_LEGACY_TOOL: ${{ inputs.tool }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
