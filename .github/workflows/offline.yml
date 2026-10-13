@@ -1,0 +1,48 @@
+name: HyperFrames real offline Windows acceptance
+on:
+  workflow_dispatch:
+    inputs:
+      component_url:
+        description: Immutable MediaHub HyperFrames GitHub release ZIP URL
+        required: true
+        type: string
+      component_sha256:
+        description: Full SHA256 of the release ZIP
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  offline-component:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      MEDIAHUB_COMPONENT_URL: ${{ inputs.component_url }}
+      MEDIAHUB_COMPONENT_SHA256: ${{ inputs.component_sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+          cache: npm
+      - name: Install verification dependencies without tool or Electron downloads
+        shell: pwsh
+        run: npm ci --ignore-scripts
+      - name: Verify package and block only its media runtime network in this disposable VM
+        shell: pwsh
+        run: node ./scripts/accept-offline.cjs
+      - name: Remove this run's temporary scoped rules even if the acceptance is interrupted
+        if: always()
+        shell: pwsh
+        run: node ./scripts/accept-offline.cjs --cleanup
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mediahub-hyperframes-real-offline-acceptance
+          path: |
+            work/offline-acceptance/report.public.json
+            work/offline-acceptance/*.raw.json
+            work/offline-acceptance/studio-*.png
+            work/offline-acceptance/工作空间 中文 空格/*/.mediahub/checks/*.png
+          if-no-files-found: warn
+          retention-days: 14

@@ -140,7 +140,7 @@ async function call(method, params = {}) {
       if (hasWork() || studio) throw new Error('请关闭视频编辑页并等待当前任务完成后安装平台更新');
       updateInstallScheduled = true;
       // Return the acceptance receipt before restarting the process and closing its pipe.
-      setTimeout(() => updates.call('install').catch(error => { updateInstallScheduled = false; log('update-install', error.message); }), 150);
+      setTimeout(() => updates.call('install').then(state => { if (state.status !== 'installing') updateInstallScheduled = false; }).catch(error => { updateInstallScheduled = false; log('update-install', error.message); }), 150);
       return { accepted: true, targetVersion: updates.snapshot().availableVersion, status: 'scheduled' };
     }
     return updates.call(method.slice('platform.updates/'.length));
@@ -194,7 +194,7 @@ async function openStudio(projectId, bounds) {
   window.contentView.addChildView(studio); studio.setBounds(clampBounds(bounds));
   const currentStudio = studio;
   try { await currentStudio.webContents.loadURL(target.href); }
-  catch (error) { if (generation === studioGeneration) await closeStudio(); throw error; }
+  catch (error) { if (generation === studioGeneration) await closeStudio(); throw new Error('Studio 页面加载失败，请关闭后重试（' + (error.code || 'LOAD_FAILED') + '）'); }
   if (generation !== studioGeneration) return { cancelled: true };
   return { ready: true, projectId };
 }
