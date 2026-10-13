@@ -8,9 +8,14 @@ const { EventEmitter } = require('node:events');
 class HyperframesClient extends EventEmitter {
   constructor({ helperPath, log }) {
     super(); this.helperPath = helperPath; this.log = log || (() => {});
-    this.child = null; this.root = null; this.sequence = 0; this.pending = new Map(); this.tasks = new Map(); this.finished = new Map();
+    this.child = null; this.root = null; this.sequence = 0; this.pending = new Map(); this.tasks = new Map(); this.finished = new Map(); this.active = new Set(); this.starting = null;
   }
   async start(root) {
+    if (this.starting) { await this.starting; return this.start(root); }
+    this.starting = this.startInternal(root);
+    try { return await this.starting; } finally { this.starting = null; }
+  }
+  async startInternal(root) {
     root = fs.realpathSync(root);
     if (this.child && this.root === root) return this.request('status', {});
     await this.stop();
@@ -42,6 +47,7 @@ class HyperframesClient extends EventEmitter {
         this.emit('task', message);
         const terminal = ['completed', 'failed', 'cancelled', 'interrupted'].includes(message.status || message.state);
         if (terminal) {
+          this.active.delete(message.taskId);
           this.finished.set(message.taskId, message);
           const task = this.tasks.get(message.taskId);
           if (task) { this.tasks.delete(message.taskId); task.resolve(message); }
@@ -61,6 +67,7 @@ class HyperframesClient extends EventEmitter {
     this.pending.clear();
     for (const task of this.tasks.values()) task.reject(error);
     this.tasks.clear();
+    this.active.clear();
   }
   request(method, params = {}, timeout = 60000) {
     if (!this.child || this.child.exitCode !== null) return Promise.reject(new Error('HyperFrames 服务尚未启动'));
@@ -79,18 +86,28 @@ class HyperframesClient extends EventEmitter {
     const taskId = context.taskId || params.taskId;
     if (!taskId) throw new Error('渲染必须带有平台任务 ID');
     const result = this.waitTask(taskId, context);
+    this.active.add(taskId);
     result.catch(() => {});
     const cancel = () => { this.request('cancel', { taskId }, 180000).catch(error => this.log('cancel', error.message)); };
     context.signal?.addEventListener('abort', cancel, { once: true });
     try {
       if (context.signal?.aborted) throw Object.assign(new Error('任务已取消'), { name: 'AbortError' });
-      await this.request('render', { ...params, taskId }, 60000);
+      try { await this.request('render', { ...params, taskId }, 60000); }
+      catch (error) {
+        if (error.code) { this.active.delete(taskId); throw error; }
+        // A transport timeout does not prove that a render was rejected. Query, never replay.
+        const status = await this.request('status', { taskId }, 30000).catch(() => null);
+        if (['complete', 'completed', 'failed', 'cancelled'].includes(status?.status)) {
+          status.status = status.status === 'complete' ? 'completed' : status.status;
+          this.active.delete(taskId); this.tasks.get(taskId)?.resolve(status); this.tasks.delete(taskId);
+        } else if (!status || !['queued', 'rendering', 'validating', 'running'].includes(status.status)) throw error;
+      }
       const receipt = await result;
       const state = receipt.status || receipt.state;
       if (state === 'cancelled') throw Object.assign(new Error('渲染已取消，进程已停止'), { name: 'AbortError', code: 'CANCELLED' });
       if (state !== 'completed') throw new Error(receipt.error?.message || receipt.error || '渲染失败');
       return receipt;
-    } finally { context.signal?.removeEventListener('abort', cancel); this.tasks.delete(taskId); }
+    } finally { context.signal?.removeEventListener('abort', cancel); if (!this.active.has(taskId)) this.tasks.delete(taskId); }
   }
   waitTask(taskId, context = {}) {
     if (this.finished.has(taskId)) return Promise.resolve(this.finished.get(taskId));
@@ -101,10 +118,15 @@ class HyperframesClient extends EventEmitter {
     if (!child) return;
     try { await this.request('shutdown', {}, 180000); } catch (error) { this.log('shutdown', error.message); }
     if (child.exitCode === null) {
-      await new Promise(resolve => { const timer = setTimeout(() => { child.kill(); resolve(); }, 5000); child.once('exit', () => { clearTimeout(timer); resolve(); }); });
+      await new Promise((resolve, reject) => {
+        const killTimer = setTimeout(() => child.kill(), 5000);
+        const timeout = setTimeout(() => reject(new Error('未能确认 HyperFrames 进程组停止')), 20000);
+        child.once('exit', () => { clearTimeout(killTimer); clearTimeout(timeout); resolve(); });
+      });
     }
     this.child = null; this.root = null;
   }
-  get busy() { return this.tasks.size > 0; }
+  async cancelActive() { for (const taskId of [...this.active]) await this.request('cancel', { taskId }, 180000); }
+  get busy() { return this.active.size > 0; }
 }
 module.exports = { HyperframesClient };

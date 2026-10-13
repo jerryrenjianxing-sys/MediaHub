@@ -3,7 +3,14 @@ set -Eeuo pipefail
 
 # Run with the MSYS2 UCRT64 shell. No sources or build files are edited in place.
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+if [[ -f "$SCRIPT_DIR/../../.github/workflows/ffmpeg.yml" ]]; then
+  REPO_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
+  WORKFLOW_SOURCE="$REPO_DIR/.github/workflows/ffmpeg.yml"
+else
+  # The published corresponding-source archive is independently buildable.
+  REPO_DIR="$SCRIPT_DIR"
+  WORKFLOW_SOURCE="$SCRIPT_DIR/ffmpeg.yml"
+fi
 BUILD_ROOT="${MEDIAHUB_FFMPEG_BUILD_ROOT:-$REPO_DIR/work/ffmpeg-build}"
 mkdir -p "$BUILD_ROOT"
 BUILD_ROOT="$(cd -- "$BUILD_ROOT" && pwd)"
@@ -16,7 +23,8 @@ BINARY_OUT="$OUT/windows-x64"
 JOBS="${MEDIAHUB_BUILD_JOBS:-$(nproc)}"
 case "$MSYSTEM" in UCRT64) ;; *) printf 'Use MSYS2 UCRT64, got %s\n' "${MSYSTEM:-unknown}" >&2; exit 2 ;; esac
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid build jobs\n' >&2; exit 2; }
-mkdir -p "$PREFIX" "$ARCHIVES" "$BUILD" "$SOURCE_OUT/source-archives" "$SOURCE_OUT/build-records" "$SOURCE_OUT/licenses" "$BINARY_OUT/licenses"
+mkdir -p "$PREFIX" "$ARCHIVES" "$BUILD" "$SOURCE_OUT/source-archives" "$SOURCE_OUT/build-records/x264" "$SOURCE_OUT/build-records/ffmpeg" "$SOURCE_OUT/licenses" "$BINARY_OUT/licenses"
+if [[ -d "$SCRIPT_DIR/source-archives" ]]; then cp -- "$SCRIPT_DIR/source-archives/"* "$ARCHIVES/"; fi
 export SOURCE_DATE_EPOCH=1777856400
 export LC_ALL=C
 export TZ=UTC
@@ -44,7 +52,7 @@ fetch 'https://code.videolan.org/videolan/x264/-/archive/b35605ace3ddf7c1a5d67a2
 fetch 'https://zlib.net/fossils/zlib-1.3.1.tar.gz' 'zlib-1.3.1.tar.gz' '9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23' 'zlib-1.3.1'
 
 cp -- "$SCRIPT_DIR/source-lock.json" "$SCRIPT_DIR/build.sh" "$SCRIPT_DIR/README.md" "$SCRIPT_DIR/verify.ps1" "$SOURCE_OUT/"
-cp -- "$REPO_DIR/.github/workflows/ffmpeg.yml" "$SOURCE_OUT/ffmpeg.yml"
+cp -- "$WORKFLOW_SOURCE" "$SOURCE_OUT/ffmpeg.yml"
 cp -- "$SCRIPT_DIR/source-lock.json" "$BINARY_OUT/"
 printf 'No upstream source patches are applied. configure/make only create generated build files.\n' > "$SOURCE_OUT/patches.txt"
 pacman -Q > "$SOURCE_OUT/build-records/msys2-packages.txt"
@@ -65,7 +73,7 @@ make -j "$JOBS"
 make install-lib-static
 cp -- COPYING "$SOURCE_OUT/licenses/x264-COPYING"
 cp -- COPYING "$BINARY_OUT/licenses/x264-COPYING"
-cp -- config.mak config.h x264_config.h "$SOURCE_OUT/build-records/"
+cp -- config.mak config.h x264_config.h "$SOURCE_OUT/build-records/x264/"
 
 cd "$BUILD/ffmpeg-8.1.1"
 ./configure \
@@ -80,7 +88,7 @@ make -j "$JOBS" ffmpeg.exe ffprobe.exe
 cp -- ffmpeg.exe ffprobe.exe "$BINARY_OUT/"
 cp -- COPYING.GPLv2 COPYING.GPLv3 COPYING.LGPLv2.1 COPYING.LGPLv3 LICENSE.md "$SOURCE_OUT/licenses/"
 cp -- COPYING.GPLv2 LICENSE.md "$BINARY_OUT/licenses/"
-cp -- config.h config_components.h ffbuild/config.mak ffbuild/config.log "$SOURCE_OUT/build-records/"
+cp -- config.h config_components.h ffbuild/config.mak ffbuild/config.log "$SOURCE_OUT/build-records/ffmpeg/"
 "$BINARY_OUT/ffmpeg.exe" -version > "$BINARY_OUT/version.txt"
 "$BINARY_OUT/ffmpeg.exe" -buildconf > "$BINARY_OUT/buildconf.txt" 2>&1
 "$BINARY_OUT/ffmpeg.exe" -L > "$BINARY_OUT/license.txt" 2>&1

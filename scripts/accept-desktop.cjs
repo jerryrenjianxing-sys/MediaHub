@@ -49,7 +49,7 @@ async function main() {
   assert.equal(await page.evaluate(() => typeof window.require), 'undefined');
   assert.deepEqual(errors, []);
   fs.writeFileSync(path.join(reportRoot, 'result.json'), JSON.stringify({ version: snapshot.version, passed: true, baseDownloads: 0, tools: snapshot.tools.map(t => ({ id: t.id, state: t.status })), screenshots: 8, testedResolutions: ['1280x850', '1024x768'], connectionAvailable: snapshot.connection.available, profile: 'acceptance', projectCreated: project.id, tests: ['shared workspace', 'four uninstalled tools', 'empty downloads', 'themes', 'navigation', 'Chinese/spaces', 'no renderer Node', 'no page errors'], completedAt: new Date().toISOString() }, null, 2));
-  await page.evaluate(() => window.mediaHub.call('platform.quit'));
-  await browser.close();
+  await page.evaluate(() => window.mediaHub.call('platform.quit')).catch(error => { if (!/closed|destroyed/i.test(error.message)) throw error; });
+  await browser.close().catch(() => {});
 }
 main().catch(error => { fs.writeFileSync(path.join(reportRoot, 'failure.txt'), error.stack); child.kill(); console.error(error.stack); process.exitCode = 1; });

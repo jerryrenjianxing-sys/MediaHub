@@ -24,8 +24,9 @@ function request(url, signal, redirects = 0) {
   });
 }
 async function downloadVerified(pkg, target, { signal, progress = () => {} } = {}) {
+  signal?.throwIfAborted();
   ensureDir(path.dirname(target));
-  if (fs.existsSync(target) && await sha256(target) === pkg.sha256) return target;
+  if (fs.existsSync(target) && fs.statSync(target).size === pkg.bytes && await sha256(target) === pkg.sha256) return target;
   const partial = `${target}.${crypto.randomUUID()}.partial`;
   try {
     const res = await request(pkg.url, signal);

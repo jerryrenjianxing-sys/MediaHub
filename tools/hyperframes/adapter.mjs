@@ -28,7 +28,7 @@ export class HyperframesAdapter {
   constructor({onEvent=()=>{}, runtime}={}) {
     this.runtime=runtime || applyRuntimeEnvironment(); this.onEvent=onEvent;
     this.projects=new Map(); this.tasks=new Map(); this.activeTask=null; this.closed=false;
-    this.watchers=new Map(); this.clients=new Set(); this.instanceToken=crypto.randomBytes(32).toString('hex'); this.connected=false;
+    this.watchers=new Map(); this.clients=new Set(); this.browsers=new Set(); this.browserLaunches=new Set(); this.instanceToken=crypto.randomBytes(32).toString('hex'); this.connected=false;
   }
   emit(value) { this.onEvent(value); for (const notify of this.clients) notify(value); }
   async dispatch(method, params={}) {
@@ -42,27 +42,34 @@ export class HyperframesAdapter {
     const dir=await fsp.realpath(projectDir); const file=await safeFile(dir,'mediahub-hyperframes.json');
     const metadata=await jsonRead(file);
     if (metadata.tool!=='hyperframes' || !/^[a-zA-Z0-9-]{1,100}$/.test(metadata.id)) throw error('INVALID_PROJECT','This is not a MediaHub HyperFrames project');
-    const project={id:metadata.id,dir,title:metadata.title,metadata}; this.projects.set(project.id,project);
+    const platformFile=path.join(dir,'project.json'); const platformMetadata=fs.existsSync(platformFile)?await jsonRead(await safeFile(dir,'project.json')):null;
+    const platformId=platformMetadata?.id || metadata.platformProjectId || metadata.id;
+    if(!/^[a-zA-Z0-9-]{1,100}$/.test(platformId))throw error('INVALID_PROJECT','Invalid platform project identity');
+    const project={id:platformId,upstreamProjectId:metadata.id,dir,title:platformMetadata?.name || metadata.title,metadata}; this.projects.set(project.id,project);
     const recordDir=path.join(dir,'.mediahub','tasks');
     if (fs.existsSync(recordDir)) for (const name of await fsp.readdir(recordDir)) {
       if (!name.endsWith('.json')) continue;
       const saved=await jsonRead(path.join(recordDir,name)).catch(()=>null);
       if (!saved || this.tasks.has(saved.id)) continue;
+      saved.projectId=project.id;
       if (['rendering','queued','validating'].includes(saved.status)) { saved.status='interrupted'; saved.error='上次执行异常结束；请检查输出文件后重新发起任务。'; saved.endedAt=new Date().toISOString(); await writeJson(path.join(recordDir,name),saved); }
       this.tasks.set(saved.id,saved);
     }
     return project;
   }
-  async create({projectDir,title='我的视频项目',orientation='landscape',duration=6,assets=[]}) {
+  async create({projectDir,projectId,title='我的视频项目',orientation='landscape',duration=6,assets=[]}) {
     assertRuntime(this.runtime);
     if (!['landscape','portrait'].includes(orientation)) throw error('INVALID_ORIENTATION','Use landscape or portrait');
     if (!Number.isFinite(duration) || duration<1 || duration>600) throw error('INVALID_DURATION','Duration must be between 1 and 600 seconds');
     if (!path.isAbsolute(projectDir || '')) throw error('INVALID_PROJECT','An absolute projectDir is required');
     const dir=path.resolve(projectDir);
+    const platformMetadata=fs.existsSync(path.join(dir,'project.json'))?await jsonRead(path.join(dir,'project.json')):null;
+    const id=projectId || platformMetadata?.id || crypto.randomUUID();
+    if(!/^[a-zA-Z0-9-]{1,100}$/.test(id) || (platformMetadata?.id && platformMetadata.id!==id))throw error('INVALID_PROJECT','HyperFrames must use the platform project identity');
     // A platform project may already contain metadata; never overwrite a composition.
     if (fs.existsSync(path.join(dir,'index.html')) || fs.existsSync(path.join(dir,'mediahub-hyperframes.json'))) throw error('PROJECT_EXISTS','This project already contains a composition');
     await fsp.mkdir(path.join(dir,'assets'),{recursive:true}); await fsp.mkdir(path.join(dir,'renders'),{recursive:true});
-    const id=crypto.randomUUID(); const metadata={schemaVersion:1,id,tool:'hyperframes',toolVersion:versions.tool,title:String(title).slice(0,200),orientation,width:orientation==='portrait'?1080:1920,height:orientation==='portrait'?1920:1080,fps:30,duration,createdAt:new Date().toISOString(),assets:[]};
+    const metadata={schemaVersion:1,id,platformProjectId:id,tool:'hyperframes',toolVersion:versions.tool,title:String(title).slice(0,200),orientation,width:orientation==='portrait'?1080:1920,height:orientation==='portrait'?1920:1080,fps:30,duration,createdAt:new Date().toISOString(),assets:[]};
     await fsp.copyFile(this.runtime.font,path.join(dir,'assets','NotoSansSC.ttf'));
     for (const filename of ['gsap.min.js','CustomEase.min.js','MotionPathPlugin.min.js']) await fsp.copyFile(path.join(componentRoot,'node_modules','gsap','dist',filename),path.join(dir,'assets',filename));
     await fsp.writeFile(path.join(dir,'index.html'),createTemplate(metadata)); await fsp.writeFile(path.join(dir,'DESIGN.md'),design);
@@ -100,11 +107,15 @@ export class HyperframesAdapter {
     return {...result,findings,ok:result.totalErrors===0 && offlineFindings.length===0,totalErrors:result.totalErrors+offlineFindings.length};
   }
   async check({projectDir}) {
+    if(this.closed)throw error('TOOL_CLOSED','Tool is shutting down');
     assertRuntime(this.runtime); const project=await this.project(projectDir); const lint=await this.lint({projectDir:project.dir});
     if (!lint.ok) return {ok:false,lint,browser:{ok:false,skipped:true,reason:'先修复静态检查错误'}};
     await this.ensureServers(); const {default:puppeteer}=await import('puppeteer-core');
-    const browser=await puppeteer.launch({executablePath:this.runtime.chrome,headless:true,args:['--disable-gpu','--disable-extensions','--no-first-run','--disable-background-networking']});
+    const launching=puppeteer.launch({executablePath:this.runtime.chrome,headless:true,timeout:20000,args:['--disable-gpu','--disable-extensions','--no-first-run','--disable-background-networking']});this.browserLaunches.add(launching);
+    let browser;try{browser=await launching;}finally{this.browserLaunches.delete(launching);}
+    this.browsers.add(browser);
     try {
+      if(this.closed)throw error('TOOL_CLOSED','Tool is shutting down');
       const page=await browser.newPage(); await page.setViewport({width:project.metadata.width,height:project.metadata.height});
       const errors=[]; const blocked=[]; page.on('pageerror',e=>errors.push(e.message));
       await page.setRequestInterception(true); page.on('request',request=>{ const url=request.url(); if (/^(data:|blob:)/.test(url) || url.startsWith(this.previewOrigin+'/')) request.continue(); else {blocked.push(url); request.abort();} });
@@ -121,9 +132,10 @@ export class HyperframesAdapter {
       const screenshot=path.join(diagnosticsDir,`check-${Date.now()}.png`); await page.screenshot({path:screenshot});
       const browserResult={ok:errors.length===0 && blocked.length===0 && dimensionsOk && seekOk,errors,blockedRequests:blocked,sampled,dimensionsOk,seekOk,screenshot};
       return {ok:lint.ok && browserResult.ok,lint,browser:browserResult};
-    } finally { await browser.close(); }
+    } finally { await browser.close(); this.browsers.delete(browser); }
   }
   async startTask({projectDir,taskId=crypto.randomUUID(),quality='standard',outputPath,source='agent',composition,variables}) {
+    if(this.closed)throw error('TOOL_CLOSED','Tool is shutting down');
     assertRuntime(this.runtime); if (this.activeTask || this.renderStarting) throw error('RENDER_BUSY','已有视频正在导出，请等待或取消后重试。');
     this.renderStarting=true;
     try {
@@ -131,6 +143,7 @@ export class HyperframesAdapter {
     if (this.tasks.has(taskId)) throw error('TASK_EXISTS','Task IDs cannot be reused');
     if (!['draft','standard','high'].includes(quality)) throw error('INVALID_QUALITY','Invalid render quality');
     const project=await this.project(projectDir);
+    if(this.closed)throw error('TOOL_CLOSED','Tool is shutting down');
     const target=outputPath || path.join(project.dir,'renders',`${taskId}.mp4`);
     if (!inside(path.join(project.dir,'renders'),path.resolve(target)) || path.extname(target)!=='.mp4') throw error('INVALID_OUTPUT','Output must be an MP4 inside project/renders');
     if (fs.existsSync(target)) throw error('OUTPUT_EXISTS','Existing output is never overwritten');
@@ -201,7 +214,7 @@ export class HyperframesAdapter {
       if(!['GET','HEAD'].includes(c.req.method)&&c.req.header('origin')!==this.studioOrigin)return c.text('Invalid origin',403);
       await next();});
     studio.get('/',c=>c.html(studioHtml(this.previewOrigin)));
-    studio.get('/mediahub/projects',c=>c.json([...this.projects.values()].map(p=>({id:p.id,title:p.title,...p.metadata,previewUrl:`${this.previewOrigin}/p/${p.id}/preview`}))));
+    studio.get('/mediahub/projects',c=>c.json([...this.projects.values()].map(p=>({...p.metadata,id:p.id,title:p.title,previewUrl:`${this.previewOrigin}/p/${p.id}/preview`}))));
     studio.get('/mediahub/projects/:id/source',async c=>{const p=this.projects.get(c.req.param('id'));if(!p)return c.text('Not found',404);return c.text(await fsp.readFile(await safeFile(p.dir,'index.html'),'utf8'));});
     studio.put('/mediahub/projects/:id/source',async c=>{const p=this.projects.get(c.req.param('id'));if(!p)return c.text('Not found',404);if(this.activeTask)return c.json({error:'导出时不能修改工程'},409);const source=await c.req.text();if(Buffer.byteLength(source)>2*1024*1024)return c.json({error:'Source exceeds 2 MiB'},413);await fsp.writeFile(await safeFile(p.dir,'index.html'),source);this.emit({event:'project-changed',projectId:p.id});return c.json({saved:true});});
     studio.post('/mediahub/projects/:id/check',async c=>{const p=this.projects.get(c.req.param('id'));if(!p)return c.text('Not found',404);return c.json(await this.check({projectDir:p.dir}));});
@@ -222,6 +235,6 @@ export class HyperframesAdapter {
   }
   async shutdown() {
     if(this.shutdownPromise)return this.shutdownPromise;
-    this.closed=true;this.shutdownPromise=(async()=>{if(this.activeTask)await this.cancel({taskId:this.activeTask});for(const watcher of this.watchers.values())watcher.close();this.watchers.clear();await Promise.all([closeServer(this.studioServer),closeServer(this.previewServer)]);return {stopped:true};})();return this.shutdownPromise;
+    this.closed=true;this.shutdownPromise=(async()=>{if(this.activeTask)await this.cancel({taskId:this.activeTask});await Promise.allSettled([...this.browserLaunches]);await Promise.allSettled([...this.browsers].map(browser=>browser.close()));this.browsers.clear();for(const watcher of this.watchers.values())watcher.close();this.watchers.clear();await Promise.all([closeServer(this.studioServer),closeServer(this.previewServer)]);return {stopped:true};})();return this.shutdownPromise;
   }
 }

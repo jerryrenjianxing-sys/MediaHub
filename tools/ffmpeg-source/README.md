@@ -14,7 +14,7 @@ bash tools/ffmpeg-source/build.sh
 
 Builds are performed under ignored `work/`; choose a fresh `MEDIAHUB_FFMPEG_BUILD_ROOT` when rerunning. Binaries and corresponding source are produced under `work/ffmpeg-output/`. `MEDIAHUB_BUILD_JOBS` optionally limits parallel compilation.
 
-To build without downloading source archives, copy the three exact archives from the accompanying source bundle into `$MEDIAHUB_FFMPEG_BUILD_ROOT/source-archives/` before running the script. Their hashes are still verified.
+The published source bundle also works on its own: extract it into a folder, open that folder in MSYS2 UCRT64, and run `bash ./build.sh`. It uses the included archives without downloading them and writes generated files under that folder's `work/`. Their hashes are still verified. When using the repository instead, copy the three exact archives into `$MEDIAHUB_FFMPEG_BUILD_ROOT/source-archives/` before running the script to build without downloading sources.
 
 The source archive contains the three complete untouched upstream archives, lock file, workflow and build script, generated configuration, configuration logs, licenses, MinGW toolchain notices, and the exact installed package versions. Compiler packages can evolve; this recipe makes the media source and configuration rebuildable, and does not claim that a future different compiler produces identical bytes.
 

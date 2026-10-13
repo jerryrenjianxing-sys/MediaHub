@@ -5,10 +5,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
+const https = require('node:https');
+const { Readable } = require('node:stream');
+const { EventEmitter } = require('node:events');
 const { DatabaseSync } = require('node:sqlite');
 const { createManager, DEFAULT_TOOLS } = require('../desktop/core/manager.cjs');
 const { verifyEnvelope } = require('../desktop/core/catalog.cjs');
-const { extractZip } = require('../desktop/core/packages.cjs');
+const { extractZip, downloadVerified } = require('../desktop/core/packages.cjs');
 
 async function terminal(manager, taskId) {
   for (let attempts = 0; attempts < 300; attempts++) {
@@ -130,4 +133,21 @@ test('restart marks uncertain work interrupted without replay and filters forged
   t.after(() => recovered.close()); await recovered.ready;
   assert.equal((await recovered.call('tasks.get', { taskId: task.id })).state, 'interrupted'); assert.equal(invocations, 0);
   assert.deepEqual(await recovered.call('artifacts.list'), []); assert.equal(fs.readFileSync(external, 'utf8'), 'unrelated'); await recovered.close();
+});
+
+test('download rejects a changed body and repairs a corrupt cache using verified bytes', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mediahub-download-')); t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const body = Buffer.from('verified payload'), checksum = crypto.createHash('sha256').update(body).digest('hex');
+  let served = Buffer.from('tampered payload');
+  const original = https.get;
+  https.get = (_url, _options, callback) => {
+    const req = new EventEmitter(); req.setTimeout = () => req;
+    process.nextTick(() => { const response = Readable.from([served]); response.statusCode = 200; callback(response); }); return req;
+  };
+  t.after(() => { https.get = original; });
+  const target = path.join(root, 'package.zip'); const pkg = { url: 'https://example.invalid/package.zip', sha256: checksum, bytes: body.length };
+  await assert.rejects(downloadVerified(pkg, target), { code: 'CHECKSUM_MISMATCH' });
+  assert.deepEqual(fs.readdirSync(root), []);
+  fs.writeFileSync(target, 'corrupt cache'); served = body;
+  await downloadVerified(pkg, target); assert.deepEqual(fs.readFileSync(target), body);
 });

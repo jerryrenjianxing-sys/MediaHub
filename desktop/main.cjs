@@ -28,13 +28,13 @@ const userSid = execFileSync(path.join(process.env.SystemRoot, 'System32/whoami.
 if (!userSid) throw new Error('无法确认当前 Windows 用户身份');
 const pipeName = `MediaHub-${crypto.createHash('sha256').update(`${userSid}|${dataRoot.toLowerCase()}`).digest('hex').slice(0, 24)}`;
 const helperPath = app.isPackaged ? path.join(resourceRoot, 'native/mediahub-pipe.exe') : path.join(sourceRoot, 'build/native/mediahub-pipe.exe');
-let manager, window, tray, studio, pipeServer, updates, quitting = false, quitWait = false, ready = false, studioGeneration = 0;
+let manager, window, tray, studio, pipeServer, updates, quitting = false, quitWait = false, ready = false, studioGeneration = 0, pipeReady = false;
 const externalTasks = new Map();
 fs.mkdirSync(path.join(dataRoot, 'logs'), { recursive: true });
 function log(kind, value) { fs.appendFileSync(path.join(dataRoot, 'logs/desktop.log'), `${new Date().toISOString()} ${kind} ${String(value).slice(0, 8000)}\n`); }
 const hf = new HyperframesClient({ helperPath, log });
 
-function snapshot() { return { ...manager.snapshot(), platformUpdates: updates?.snapshot() || { status: 'unavailable', currentVersion: app.getVersion(), error: '开发模式未启用平台升级' }, connection: { ...(manager.snapshot().connection || {}), transport: 'windows-named-pipe', pipe: pipeName, pipeName, endpoint: `\\\\.\\pipe\\${pipeName}`, skillPath: path.join(resourceRoot, 'agent-skill/mediahub'), available: !!pipeServer, profile: profile ? 'acceptance' : 'production' } }; }
+function snapshot() { return { ...manager.snapshot(), platformUpdates: updates?.snapshot() || { status: 'unavailable', currentVersion: app.getVersion(), error: '开发模式未启用平台升级' }, connection: { ...(manager.snapshot().connection || {}), transport: 'windows-named-pipe', pipe: pipeName, pipeName, endpoint: `\\\\.\\pipe\\${pipeName}`, skillPath: path.join(resourceRoot, 'agent-skill/mediahub'), available: pipeReady, profile: profile ? 'acceptance' : 'production' } }; }
 function changed() { if (window && !window.isDestroyed() && ready) window.webContents.send('mediahub:changed', snapshot()); maybeFinishQuit(); }
 function busyTasks() { return manager?.snapshot().tasks.filter(t => ['queued', 'running', 'cancelling'].includes(t.state)) || []; }
 function busyOperations() { return manager?.snapshot().operations?.filter(o => ['queued', 'running', 'downloading', 'installing', 'verifying', 'starting'].includes(o.state || o.status)) || []; }
@@ -128,7 +128,12 @@ async function call(method, params = {}) {
     return updates.call(method.slice('platform.updates/'.length));
   }
   if (method === 'agent.connection') return snapshot().connection;
-  if (method === 'platform.quit') { await requestQuit(); return { accepted: true }; }
+  if (method === 'platform.quit') { if (params.mode && !['wait', 'cancel'].includes(params.mode)) throw new Error('退出方式无效'); await requestQuit(params.mode); return { accepted: true }; }
+  if (profile && method === 'acceptance.window') {
+    if (params.action === 'close') window.close();
+    if (params.action === 'show') window.show();
+    return { visible: window.isVisible(), destroyed: window.isDestroyed(), bounds: window.getBounds(), scaleFactor: require('electron').screen.getDisplayMatching(window.getBounds()).scaleFactor, studioAttached: !!studio };
+  }
   // Every UI and Agent request reaches the same manager; no renderer-owned state changes.
   return manager.call(method, params);
 }
@@ -194,9 +199,14 @@ function startPipe() {
   if (!fs.existsSync(helperPath)) { log('agent', 'Native helper absent; connection unavailable'); return; }
   pipeServer = spawn(helperPath, ['server', '--pipe', pipeName], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
   readline.createInterface({ input: pipeServer.stdout }).on('line', async line => {
-    if (Buffer.byteLength(line) > 1024 * 1024) return;
-    let envelope; try { envelope = JSON.parse(line); } catch { return; }
-    if (envelope.event === 'ready') { changed(); return; }
+    if (Buffer.byteLength(line) > 1024 * 1024 + 200) return;
+    let envelope;
+    try { envelope = JSON.parse(line); } catch {
+      const transportId = line.match(/^\{"transportId":(\d+),/)?.[1];
+      if (transportId) pipeServer?.stdin.write(JSON.stringify({ transportId: Number(transportId), response: { id: null, ok: false, error: { code: 'INVALID_JSON', message: '请求 JSON 格式无效' } } }) + '\n');
+      return;
+    }
+    if (envelope.event === 'ready') { pipeReady = true; changed(); return; }
     if (!envelope.transportId || !envelope.request) return;
     const request = envelope.request;
     let response;
@@ -205,8 +215,8 @@ function startPipe() {
     pipeServer?.stdin.write(JSON.stringify({ transportId: envelope.transportId, response }) + '\n');
   });
   pipeServer.stderr.on('data', data => log('pipe', String(data)));
-  pipeServer.on('error', error => { log('pipe', error.message); pipeServer = null; changed(); });
-  pipeServer.on('exit', code => { log('pipe', `stopped ${code}`); pipeServer = null; changed(); });
+  pipeServer.on('error', error => { log('pipe', error.message); pipeServer = null; pipeReady = false; changed(); });
+  pipeServer.on('exit', code => { log('pipe', `stopped ${code}`); pipeServer = null; pipeReady = false; changed(); });
   const connection = { schema: 1, protocol: 1, transport: 'windows-named-pipe', pipe: pipeName, pipeName, clientPath: helperPath, powerShellClient: path.join(resourceRoot, 'agent-skill/mediahub/scripts/MediaHub.ps1'), pid: process.pid, version: app.getVersion(), acceptance: !!profile };
   const target = path.join(dataRoot, 'connection.json'); const temporary = target + '.tmp'; fs.writeFileSync(temporary, JSON.stringify(connection, null, 2)); fs.renameSync(temporary, target);
 }
@@ -260,7 +270,7 @@ async function requestQuit(choice) {
     }
     if (choice === 'continue') return;
     quitWait = true;
-    if (choice === 'cancel') for (const task of [...busyTasks(), ...busyOperations()]) await manager.call('tasks.cancel', { taskId: task.id });
+    if (choice === 'cancel') { for (const task of [...busyTasks(), ...busyOperations()]) await manager.call('tasks.cancel', { taskId: task.id }); await hf.cancelActive(); }
     changed(); return;
   }
   await finishQuit();

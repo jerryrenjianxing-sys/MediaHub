@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <sddl.h>
+#include <tlhelp32.h>
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -52,6 +53,20 @@ bool frameWrite(HANDLE pipe, const std::string& value) {
   if (value.empty() || value.size() > Limit) return false;
   const DWORD length = static_cast<DWORD>(value.size());
   return writeExact(pipe, &length, sizeof(length)) && writeExact(pipe, value.data(), length);
+}
+bool singleLine(std::string& json) {
+  bool quoted = false, escaped = false;
+  for (char& c : json) {
+    if (quoted) {
+      if (static_cast<unsigned char>(c) < 32) return false;
+      if (escaped) escaped = false; else if (c == '\\') escaped = true; else if (c == '"') quoted = false;
+    } else {
+      if (c == '"') quoted = true;
+      else if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+      else if (static_cast<unsigned char>(c) < 32) return false;
+    }
+  }
+  return !quoted;
 }
 bool getUserSid(std::wstring& sidText) {
   HANDLE raw = nullptr;
@@ -121,6 +136,7 @@ void serveConnection(HANDLE raw) {
   Handle pipe(raw);
   std::string request;
   if (!frameRead(pipe.value, request)) return;
+  if (!singleLine(request)) { frameWrite(pipe.value, "{\"ok\":false,\"error\":{\"code\":\"INVALID_JSON\",\"message\":\"Invalid JSON string\"}}"); return; }
   const auto id = nextId.fetch_add(1);
   { std::lock_guard<std::mutex> lock(outputMutex); std::cout << "{\"transportId\":" << id << ",\"request\":" << request << "}" << std::endl; }
   std::unique_lock<std::mutex> lock(responseMutex);
@@ -142,6 +158,7 @@ int server(const std::wstring& name) {
   while (!stopped) {
     HANDLE pipe = CreateNamedPipeW(endpoint.c_str(), PIPE_ACCESS_DUPLEX | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0), PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, 16, Limit + 4, Limit + 4, 0, &security);
     if (pipe == INVALID_HANDLE_VALUE) { LocalFree(descriptor); return 5; }
+    if (first) { std::lock_guard<std::mutex> lock(outputMutex); std::cout << "{\"event\":\"ready\"}" << std::endl; }
     first = false;
     const bool connected = ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED;
     if (connected) std::thread(serveConnection, pipe).detach(); else CloseHandle(pipe);
@@ -163,9 +180,20 @@ std::wstring quoteArgument(const std::wstring& arg) {
   for (const wchar_t c : arg) { if (c == L'\\') ++slashes; else { result.append(slashes * (c == L'"' ? 2 : 1), L'\\'); slashes = 0; if (c == L'"') result += L'\\'; result += c; } }
   result.append(slashes * 2, L'\\'); result += L'"'; return result;
 }
+HANDLE parentProcess() {
+  Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+  if (snapshot.value == INVALID_HANDLE_VALUE) return nullptr;
+  PROCESSENTRY32W entry{}; entry.dwSize = sizeof(entry);
+  if (!Process32FirstW(snapshot.value, &entry)) return nullptr;
+  do {
+    if (entry.th32ProcessID == GetCurrentProcessId()) return OpenProcess(SYNCHRONIZE, FALSE, entry.th32ParentProcessID);
+  } while (Process32NextW(snapshot.value, &entry));
+  return nullptr;
+}
 int job(int argc, wchar_t** argv) {
   if (argc < 3) return 11;
   int start = std::wstring(argv[2]) == L"--" ? 3 : 2; if (start >= argc) return 11;
+  Handle owner(parentProcess()); if (!owner.value) return 17;
   Handle ownedJob(CreateJobObjectW(nullptr, nullptr)); if (!ownedJob.value) return 12;
   JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
   limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -179,7 +207,13 @@ int job(int argc, wchar_t** argv) {
   if (!CreateProcessW(argv[start], command.data(), nullptr, nullptr, TRUE, CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) return 14;
   Handle child(process.hProcess), thread(process.hThread);
   if (!AssignProcessToJobObject(ownedJob.value, child.value)) { TerminateProcess(child.value, 15); return 15; }
-  ResumeThread(thread.value); WaitForSingleObject(child.value, INFINITE);
+  ResumeThread(thread.value);
+  HANDLE waiting[] = { child.value, owner.value };
+  const DWORD reason = WaitForMultipleObjects(2, waiting, FALSE, INFINITE);
+  if (reason != WAIT_OBJECT_0) {
+    TerminateJobObject(ownedJob.value, 16);
+    WaitForSingleObject(child.value, INFINITE);
+  }
   DWORD exitCode = 1; GetExitCodeProcess(child.value, &exitCode); return static_cast<int>(exitCode);
 }
 }

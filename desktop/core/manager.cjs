@@ -345,8 +345,9 @@ function createManager(options = {}) {
       case 'agent.archive': if (!options.onArchiveSkill) throw fault('ARCHIVE_UNAVAILABLE', '技能下载入口尚未配置'); return options.onArchiveSkill({ connectionFile, skillPath: options.skillPath });
       case 'settings.get': return clone(settings);
       case 'settings.set': {
+        if (params.theme !== undefined && !['light', 'dark', 'system'].includes(params.theme)) throw fault('INVALID_THEME', '主题无效');
         if (params.workspacePath && params.workspacePath !== settings.workspacePath) setWorkspace(params.workspacePath);
-        if (params.theme !== undefined) { if (!['light', 'dark', 'system'].includes(params.theme)) throw fault('INVALID_THEME', '主题无效'); settings.theme = params.theme; }
+        if (params.theme !== undefined) settings.theme = params.theme;
         atomicJson(path.join(dataRoot, 'settings.json'), settings); changed(); return clone(settings);
       }
       default: throw fault('UNKNOWN_METHOD', `未知平台操作：${method}`);
@@ -396,7 +397,7 @@ function createManager(options = {}) {
   function updateExternalTask(taskId, patch) {
     const current = records.tasks[taskId]; if (!current?.external) throw fault('NOT_FOUND', '外部任务不存在');
     if (FINISHED.has(current.state)) return clone(current);
-    if (patch.state && !['running', 'cancelling', 'completed', 'failed', 'cancelled', 'interrupted'].includes(patch.state)) throw fault('INVALID_STATE', '任务状态无效');
+    if (patch.state && !['queued', 'running', 'cancelling', 'completed', 'failed', 'cancelled', 'interrupted'].includes(patch.state)) throw fault('INVALID_STATE', '任务状态无效');
     if (patch.state === 'completed' && current.capabilityId === 'hyperframes.render') {
       if (!patch.result?.artifact?.mediaValidated) throw fault('MEDIA_NOT_VALIDATED', '渲染结果尚未通过媒体检查');
       patch.result.artifact = registerArtifact({ ...patch.result.artifact, projectId: current.projectId, toolId: current.toolId, taskId });

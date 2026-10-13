@@ -10,7 +10,7 @@ Input and output are UTF-8 NDJSON on stdin/stdout. Requests are `{ "id": "reques
 
 | Method | Parameters | Result |
 |---|---|---|
-| create | absolute projectDir; title; orientation landscape/portrait; duration 1–600; optional assets | projectId, projectDir, entry, width, height, fps |
+| create | absolute projectDir; optional platform projectId; title; orientation landscape/portrait; duration 1–600; optional assets | projectId, projectDir, entry, width, height, fps |
 | import | projectDir; assets [{assetId, sourcePath}] | Original asset IDs, hashed local copies and mappings |
 | preview | projectDir | studioUrl, previewUrl, ownPid, tokenScope, projectId |
 | lint | projectDir | ok, findings, totalErrors, per-file upstream lint results |
@@ -32,6 +32,6 @@ Studio binds to localhost and requires an instance token in an HttpOnly host-onl
 
 ## Reproducible packaging
 
-Run `npm ci --ignore-scripts` in this directory; run `node ../../scripts/package-hyperframes.mjs --prepare-only` to prepare the private runtime, then omit the flag to build the independent release archive. Optional build inputs: MEDIAHUB_NODE_CACHE, MEDIAHUB_FFMPEG_CACHE (pinned extracted Gyan binary directory), MEDIAHUB_7ZIP. Runtime hashes are validated and recorded in runtime-lock.json. Immutable ZIP, per-file manifest, sources inventory and SHA256 are emitted to release/.
+Run `npm ci --ignore-scripts` in this directory; run `node ../../scripts/package-hyperframes.mjs --prepare-only` to prepare the private runtime, then omit the flag to build the independent release archive. Required build inputs: MEDIAHUB_FFMPEG_CACHE (extracted MediaHub source-built binary directory) and MEDIAHUB_FFMPEG_SOURCE (the matching source ZIP). Optional inputs: MEDIAHUB_NODE_CACHE, MEDIAHUB_FFMPEG_SOURCE_SHA256. Runtime hashes are validated and recorded in runtime-lock.json. Immutable ZIP, per-file manifest, sources inventory and SHA256 are emitted to release/.
 
-FFmpeg Gyan full build is GPLv3 with static external libraries. The source inventory preserves the build README, exact version, build configuration, binary hashes, FFmpeg source revision, dependency notices and original source URLs. This inventory must not be misrepresented as a complete archive of all corresponding third-party source code.
+The distributable uses the MediaHub FFmpeg 8.1.1 source build with exactly two external media libraries, x264 and zlib. It includes licenses, binary checksums, build configuration, fixed source hashes and a complete corresponding-source ZIP containing the original sources, configure logs and build script. Unrelated Gyan full-build binaries are not accepted by the public packaging script.

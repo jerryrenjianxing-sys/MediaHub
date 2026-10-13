@@ -3,6 +3,7 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+const os = require('node:os');
 const net = require('node:net');
 const readline = require('node:readline');
 const { spawn } = require('node:child_process');
@@ -27,7 +28,7 @@ function runClient(pipe, request) {
 test('native current-user pipe transports framed JSON and refuses an oversized frame', { skip: !available ? 'Requires compiled Windows helper' : false }, async t => {
   const name = `MediaHub-test-${crypto.randomUUID()}`; const server = spawn(helper, ['server', '--pipe', name], { windowsHide: true });
   t.after(() => server.kill());
-  readline.createInterface({ input: server.stdout }).on('line', line => { const envelope = JSON.parse(line); server.stdin.write(JSON.stringify({ transportId: envelope.transportId, response: { ok: true, result: envelope.request } }) + '\n'); });
+  readline.createInterface({ input: server.stdout }).on('line', line => { const envelope = JSON.parse(line); if (!envelope.transportId) return; server.stdin.write(JSON.stringify({ transportId: envelope.transportId, response: { ok: true, result: envelope.request } }) + '\n'); });
   const socket = await connectPipe(`\\\\.\\pipe\\${name}`);
   const oversize = Buffer.alloc(4); oversize.writeUInt32LE(1024 * 1024 + 1); socket.write(oversize);
   await new Promise(resolve => { socket.once('close', resolve); socket.once('error', resolve); socket.resume(); });
@@ -108,4 +109,25 @@ try { $remote.Connect(1500); $remoteConnected=$remote.IsConnected } catch { $rem
     probe.stdout.on('data', data => { stdout += data; }); probe.stderr.on('data', data => { stderr += data; }); probe.once('error', reject); probe.once('exit', code => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(stderr)));
   });
   assert.deepEqual(result.rules, [result.sid]); assert.match(result.sddl, /D:P/); assert.equal(result.restrictedError, 5); assert.equal(result.remoteConnected, false);
+});
+
+test('native pipe exits on parent stdin EOF and the same endpoint can restart', { skip: !available ? 'Requires compiled Windows helper' : false }, async t => {
+  const name = `MediaHub-restart-${crypto.randomUUID()}`;
+  const first = spawn(helper, ['server', '--pipe', name], { windowsHide: true }); t.after(() => first.kill());
+  const initial = await connectPipe(`\\\\.\\pipe\\${name}`); initial.destroy();
+  const exited = new Promise(resolve => first.once('exit', resolve)); first.stdin.end();
+  await Promise.race([exited, delay(5000).then(() => { throw new Error('pipe survived parent EOF'); })]);
+  const second = spawn(helper, ['server', '--pipe', name], { windowsHide: true }); t.after(() => second.kill());
+  const restarted = await connectPipe(`\\\\.\\pipe\\${name}`); restarted.destroy(); assert.equal(second.exitCode, null);
+});
+test('native owned job stops its tree after abrupt parent process exit', { skip: !available ? 'Requires compiled Windows helper' : false }, async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mediahub-native-owner-')); const marker = path.join(directory, 'pids.json');
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const managedScript = `const {spawn}=require('node:child_process'); const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',windowsHide:true});require('node:fs').writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid,grandchild:child.pid}));setInterval(()=>{},1000);`;
+  const fixtureScript = `const fs=require('node:fs');const {spawn}=require('node:child_process');const worker=spawn(${JSON.stringify(helper)},['job','--',process.execPath,'-e',${JSON.stringify(managedScript)}],{windowsHide:true,stdio:'ignore',detached:true});worker.unref();const timer=setInterval(()=>{if(fs.existsSync(${JSON.stringify(marker)})){process.stdout.write(JSON.stringify({...JSON.parse(fs.readFileSync(${JSON.stringify(marker)},'utf8')),supervisor:worker.pid})+'\\n');clearInterval(timer);process.exit(0)}},20);`;
+  const fixture = spawn(process.execPath, ['-e', fixtureScript], { windowsHide: true });
+  const pids = await new Promise((resolve, reject) => { let output = ''; fixture.once('error', reject); fixture.stdout.on('data', data => { output += data; if (output.includes('\n')) resolve(JSON.parse(output.trim())); }); });
+  t.after(() => { try { process.kill(pids.supervisor); } catch {} });
+  for (let attempt = 0; attempt < 200; attempt++) { let alive = false; for (const pid of [pids.pid, pids.grandchild]) { try { process.kill(pid, 0); alive = true; } catch {} } if (!alive) return; await delay(25); }
+  assert.fail('owned process survived abrupt parent exit');
 });
