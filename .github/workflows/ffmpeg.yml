@@ -1,0 +1,66 @@
+name: FFmpeg Windows source build
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - tools/ffmpeg-source/**
+      - .github/workflows/ffmpeg.yml
+permissions:
+  contents: read
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    timeout-minutes: 100
+    steps:
+      - name: Preserve POSIX script line endings
+        shell: pwsh
+        run: git config --global core.autocrlf input
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        with:
+          msystem: UCRT64
+          update: true
+          path-type: strict
+          install: >-
+            make
+            curl
+            diffutils
+            tar
+            xz
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-pkgconf
+      - name: Build fixed sources with static media dependencies
+        shell: msys2 {0}
+        run: bash tools/ffmpeg-source/build.sh
+      - name: Test executables without an installed media runtime
+        shell: pwsh
+        run: ./tools/ffmpeg-source/verify.ps1 -BinaryDirectory ./work/ffmpeg-output/windows-x64 -OutputDirectory ./work/ffmpeg-output/acceptance
+      - name: Package binaries and complete corresponding source
+        shell: pwsh
+        run: |
+          $outputRoot = Join-Path $PWD 'work/ffmpeg-output'
+          $binaryAsset = Join-Path $outputRoot 'mediahub-ffmpeg-8.1.1-windows-x64.zip'
+          $sourceAsset = Join-Path $outputRoot 'mediahub-ffmpeg-8.1.1-source.zip'
+          Copy-Item -LiteralPath (Join-Path $outputRoot 'acceptance') -Destination (Join-Path $outputRoot 'source/build-records/acceptance') -Recurse
+          Compress-Archive -Path (Join-Path $outputRoot 'windows-x64/*') -DestinationPath $binaryAsset -CompressionLevel Optimal
+          Compress-Archive -Path (Join-Path $outputRoot 'source/*') -DestinationPath $sourceAsset -CompressionLevel Optimal
+          $checksums = foreach ($asset in @($binaryAsset, $sourceAsset)) { $hash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash.ToLowerInvariant(); "$hash  $([IO.Path]::GetFileName($asset))" }
+          $checksums | Set-Content -LiteralPath (Join-Path $outputRoot 'SHA256SUMS.txt') -Encoding ascii
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mediahub-ffmpeg-windows-x64
+          path: |
+            work/ffmpeg-output/mediahub-ffmpeg-8.1.1-windows-x64.zip
+            work/ffmpeg-output/mediahub-ffmpeg-8.1.1-source.zip
+            work/ffmpeg-output/SHA256SUMS.txt
+            work/ffmpeg-output/acceptance/acceptance.json
+          if-no-files-found: error
+      - name: Preserve diagnostic configuration even on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mediahub-ffmpeg-build-diagnostics
+          path: work/ffmpeg-output/source/build-records
+          if-no-files-found: warn

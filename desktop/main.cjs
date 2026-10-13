@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const readline = require('node:readline');
-const { spawn } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
 const { pathToFileURL } = require('node:url');
 const { createManager } = require('./core/manager.cjs');
 const { HyperframesClient } = require('./hyperframes-client.cjs');
@@ -24,15 +24,17 @@ if (profilePath) {
 const dataRoot = profile ? path.resolve(profile.dataRoot) : path.join(process.env.LOCALAPPDATA || app.getPath('appData'), 'MediaHub');
 app.setPath('userData', path.join(dataRoot, 'desktop'));
 app.setAppUserModelId('com.mediahub.desktop');
-const pipeName = `MediaHub-${crypto.createHash('sha256').update(`${process.env.USERDOMAIN}\\${process.env.USERNAME}|${dataRoot.toLowerCase()}`).digest('hex').slice(0, 24)}`;
-const helperPath = path.join(resourceRoot, 'native', 'mediahub-pipe.exe');
+const userSid = execFileSync(path.join(process.env.SystemRoot, 'System32/whoami.exe'), ['/user', '/fo', 'csv', '/nh'], { encoding: 'utf8', windowsHide: true, timeout: 10000 }).match(/S-1-5-(?:\d+-)*\d+/)?.[0];
+if (!userSid) throw new Error('无法确认当前 Windows 用户身份');
+const pipeName = `MediaHub-${crypto.createHash('sha256').update(`${userSid}|${dataRoot.toLowerCase()}`).digest('hex').slice(0, 24)}`;
+const helperPath = app.isPackaged ? path.join(resourceRoot, 'native/mediahub-pipe.exe') : path.join(sourceRoot, 'build/native/mediahub-pipe.exe');
 let manager, window, tray, studio, pipeServer, updates, quitting = false, quitWait = false, ready = false, studioGeneration = 0;
 const externalTasks = new Map();
 fs.mkdirSync(path.join(dataRoot, 'logs'), { recursive: true });
 function log(kind, value) { fs.appendFileSync(path.join(dataRoot, 'logs/desktop.log'), `${new Date().toISOString()} ${kind} ${String(value).slice(0, 8000)}\n`); }
 const hf = new HyperframesClient({ helperPath, log });
 
-function snapshot() { return { ...manager.snapshot(), platformUpdates: updates?.snapshot() || { status: 'unavailable', currentVersion: app.getVersion(), error: '开发模式未启用平台升级' }, connection: { ...(manager.snapshot().connection || {}), transport: 'windows-named-pipe', pipe: `\\\\.\\pipe\\${pipeName}`, available: !!pipeServer, profile: profile ? 'acceptance' : 'production' } }; }
+function snapshot() { return { ...manager.snapshot(), platformUpdates: updates?.snapshot() || { status: 'unavailable', currentVersion: app.getVersion(), error: '开发模式未启用平台升级' }, connection: { ...(manager.snapshot().connection || {}), transport: 'windows-named-pipe', pipe: pipeName, pipeName, endpoint: `\\\\.\\pipe\\${pipeName}`, skillPath: path.join(resourceRoot, 'agent-skill/mediahub'), available: !!pipeServer, profile: profile ? 'acceptance' : 'production' } }; }
 function changed() { if (window && !window.isDestroyed() && ready) window.webContents.send('mediahub:changed', snapshot()); maybeFinishQuit(); }
 function busyTasks() { return manager?.snapshot().tasks.filter(t => ['queued', 'running', 'cancelling'].includes(t.state)) || []; }
 function busyOperations() { return manager?.snapshot().operations?.filter(o => ['queued', 'running', 'downloading', 'installing', 'verifying', 'starting'].includes(o.state || o.status)) || []; }
@@ -258,7 +260,7 @@ async function requestQuit(choice) {
     }
     if (choice === 'continue') return;
     quitWait = true;
-    if (choice === 'cancel') for (const task of busyTasks()) await manager.call('tasks.cancel', { taskId: task.id });
+    if (choice === 'cancel') for (const task of [...busyTasks(), ...busyOperations()]) await manager.call('tasks.cancel', { taskId: task.id });
     changed(); return;
   }
   await finishQuit();

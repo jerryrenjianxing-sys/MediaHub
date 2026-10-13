@@ -109,16 +109,17 @@ export class HyperframesAdapter {
       const errors=[]; const blocked=[]; page.on('pageerror',e=>errors.push(e.message));
       await page.setRequestInterception(true); page.on('request',request=>{ const url=request.url(); if (/^(data:|blob:)/.test(url) || url.startsWith(this.previewOrigin+'/')) request.continue(); else {blocked.push(url); request.abort();} });
       await page.goto(`${this.previewOrigin}/p/${project.id}/preview`,{waitUntil:'networkidle0',timeout:45000});
-      await page.evaluate(()=>document.fonts.ready); await page.waitForFunction(()=>window.__playerReady===true || !!window.__timelines,{timeout:15000});
+      await page.evaluate(()=>document.fonts.ready); await page.waitForFunction(()=>window.__playerReady===true,{timeout:15000});
       const sampled=[];
       for (const time of [0,.5,project.metadata.duration/2,Math.max(0,project.metadata.duration-.1)]) {
-        await page.evaluate(t=>{ const h=window.__hyperframe || window.__hf; if (h?.seek) h.seek(t); else Object.values(window.__timelines||{}).forEach(tl=>tl.seek?.(t)); },time);
-        const sample=await page.evaluate(()=>{ const root=document.querySelector('[data-composition-id]'); const box=root?.getBoundingClientRect(); return {width:box?.width,height:box?.height,timelineCount:Object.keys(window.__timelines||{}).length}; }); sampled.push({time,...sample});
+        await page.evaluate(async t=>{ const h=window.__player; if (!h?.seek) throw Error('Runtime player was not initialized'); await h.seek(t); await new Promise(requestAnimationFrame); },time);
+        const sample=await page.evaluate(()=>{ const root=document.querySelector('[data-composition-id]'); const box=root?.getBoundingClientRect(); return {width:box?.width,height:box?.height,timelineCount:Object.keys(window.__timelines||{}).length,actualTime:window.__player?.getTime(),visibleText:[...document.querySelectorAll('h1,h2,p')].filter(el=>Number(getComputedStyle(el).opacity)>.5).length}; }); sampled.push({time,...sample});
       }
       const dimensionsOk=sampled.every(s=>s.width===project.metadata.width && s.height===project.metadata.height);
+      const seekOk=sampled.every(s=>Number.isFinite(s.actualTime)&&Math.abs(s.actualTime-s.time)<.05);
       const diagnosticsDir=path.join(project.dir,'.mediahub','checks'); await fsp.mkdir(diagnosticsDir,{recursive:true});
       const screenshot=path.join(diagnosticsDir,`check-${Date.now()}.png`); await page.screenshot({path:screenshot});
-      const browserResult={ok:errors.length===0 && blocked.length===0 && dimensionsOk,errors,blockedRequests:blocked,sampled,dimensionsOk,screenshot};
+      const browserResult={ok:errors.length===0 && blocked.length===0 && dimensionsOk && seekOk,errors,blockedRequests:blocked,sampled,dimensionsOk,seekOk,screenshot};
       return {ok:lint.ok && browserResult.ok,lint,browser:browserResult};
     } finally { await browser.close(); }
   }
@@ -176,7 +177,7 @@ export class HyperframesAdapter {
   }
   async preview({projectDir}) {
     const project=await this.project(projectDir); assertRuntime(this.runtime);await this.ensureServers();
-    if(!this.watchers.has(project.id)) { const watcher=fs.watch(project.dir,{recursive:true},(_event,filename)=>{ if(!filename || /(?:^|[\\/])(?:\.mediahub|renders)(?:[\\/]|$)/.test(filename))return;this.emit({event:'project-changed',projectId:project.id});});this.watchers.set(project.id,watcher); }
+    if(!this.watchers.has(project.id)) { let timer; const watcher=fs.watch(project.dir,{recursive:true},(_event,filename)=>{ if(!filename || /(?:^|[\\/])(?:\.mediahub|renders)(?:[\\/]|$)/.test(filename))return;clearTimeout(timer);timer=setTimeout(()=>this.emit({event:'project-changed',projectId:project.id}),150);}); const close=watcher.close.bind(watcher);watcher.close=()=>{clearTimeout(timer);close();};this.watchers.set(project.id,watcher); }
     return {studioUrl:`${this.studioOrigin}/connect?token=${this.instanceToken}&project=${project.id}`,previewUrl:`${this.previewOrigin}/p/${project.id}/preview`,ownPid:process.pid,tokenScope:'hyperframes-studio-instance',projectId:project.id};
   }
   async ensureServers() {
@@ -189,7 +190,7 @@ export class HyperframesAdapter {
     preview.get('/p/:id/preview',async c=>{const project=this.projects.get(c.req.param('id'));if(!project)return c.text('Not found',404);let html=await bundleToSingleHtml(project.dir,{inlineAssets:true,runtime:'inline',stampHfIds:false});
       html=html.replace(/<head([^>]*)>/i,`<head$1><base href="/p/${project.id}/files/">`);
       // The preview knows only the parent's origin, never its instance token or cookie.
-      const bridge=`<script>addEventListener('message',e=>{if(e.source!==parent||e.origin!==${JSON.stringify(this.studioOrigin)}||e.data?.source!=='mediahub-studio')return;const h=window.__hyperframe||window.__hf;if(e.data.action==='seek'){if(h?.seek)h.seek(e.data.time);else Object.values(window.__timelines||{}).forEach(t=>t.seek?.(e.data.time));}if(e.data.action==='play'){if(h?.play)h.play();else Object.values(window.__timelines||{}).forEach(t=>t.play?.());}if(e.data.action==='pause'){if(h?.pause)h.pause();else Object.values(window.__timelines||{}).forEach(t=>t.pause?.());}});</script>`;
+      const bridge=`<script>addEventListener('message',e=>{if(e.source!==parent||e.origin!==${JSON.stringify(this.studioOrigin)}||e.data?.source!=='mediahub-studio')return;const h=window.__player;if(e.data.action==='seek')h?.seek(e.data.time);if(e.data.action==='play')h?.play();if(e.data.action==='pause')h?.pause();});const readyTimer=setInterval(()=>{if(window.__playerReady&&window.__player){clearInterval(readyTimer);parent.postMessage({source:'mediahub-preview',type:'ready'},${JSON.stringify(this.studioOrigin)});}},25);setTimeout(()=>clearInterval(readyTimer),30000);</script>`;
       return c.html(html.replace('</body>',bridge+'</body>'));});
     preview.get('/p/:id/files/*',async c=>{const project=this.projects.get(c.req.param('id'));if(!project)return c.text('Not found',404);const relative=decodeURIComponent(new URL(c.req.url).pathname.split('/files/')[1]||'');if(relative.split(/[\\/]/).some(segment=>segment.startsWith('.')) || /(?:mediahub-hyperframes|project)\.json$/i.test(relative))return c.text('Not found',404);try{const file=await safeFile(project.dir,relative);if(!(await fsp.stat(file)).isFile())return c.text('Not found',404);return c.body(await fsp.readFile(file),200,{'Content-Type':getMimeType(file)});}catch{return c.text('Not found',404);}});
     const p=await listen(preview);this.previewServer=p.server;this.previewPort=p.port;this.previewOrigin=`http://127.0.0.1:${p.port}`;
@@ -204,6 +205,7 @@ export class HyperframesAdapter {
     studio.get('/mediahub/projects/:id/source',async c=>{const p=this.projects.get(c.req.param('id'));if(!p)return c.text('Not found',404);return c.text(await fsp.readFile(await safeFile(p.dir,'index.html'),'utf8'));});
     studio.put('/mediahub/projects/:id/source',async c=>{const p=this.projects.get(c.req.param('id'));if(!p)return c.text('Not found',404);if(this.activeTask)return c.json({error:'导出时不能修改工程'},409);const source=await c.req.text();if(Buffer.byteLength(source)>2*1024*1024)return c.json({error:'Source exceeds 2 MiB'},413);await fsp.writeFile(await safeFile(p.dir,'index.html'),source);this.emit({event:'project-changed',projectId:p.id});return c.json({saved:true});});
     studio.post('/mediahub/projects/:id/check',async c=>{const p=this.projects.get(c.req.param('id'));if(!p)return c.text('Not found',404);return c.json(await this.check({projectDir:p.dir}));});
+    studio.get('/mediahub/projects/:id/lint',async c=>{const p=this.projects.get(c.req.param('id'));if(!p)return c.text('Not found',404);return c.json(await this.lint({projectDir:p.dir}));});
     studio.post('/mediahub/tasks/:id/cancel',async c=>c.json(await this.cancel({taskId:c.req.param('id')})));
     studio.get('/mediahub/events',c=>streamSSE(c,async stream=>{const notify=value=>stream.writeSSE({data:JSON.stringify(value)}).catch(()=>{});this.clients.add(notify);await new Promise(resolve=>stream.onAbort(resolve));this.clients.delete(notify);}));
     const studioAdapter={listProjects:()=>[...this.projects.values()],resolveProject:id=>this.projects.get(id)||null,bundle:(dir,options)=>bundleToSingleHtml(dir,{...options,inlineAssets:true}),lint:(html,opts)=>lintHyperframeHtml(html,opts),lintProject:dir=>lintProject(dir),runtimeUrl:`${this.previewOrigin}/runtime.js`,rendersDir:project=>path.join(project.dir,'renders'),startRender:opts=>{

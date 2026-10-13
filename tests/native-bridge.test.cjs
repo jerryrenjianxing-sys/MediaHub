@@ -46,3 +46,66 @@ test('native rejects remote path or invalid pipe name before opening a connectio
   const code = await new Promise((resolve, reject) => { const client = spawn(helper, ['client', '--pipe', '\\\\remote\\pipe\\MediaHub'], { windowsHide: true }); client.once('error', reject); client.once('exit', resolve); client.stdin.end('{}\n'); });
   assert.notEqual(code, 0);
 });
+
+test('actual named-pipe DACL grants only the current SID and rejects a remote transport connection', { skip: !available ? 'Requires compiled Windows helper' : false }, async t => {
+  const name = `MediaHub-acl-${crypto.randomUUID()}`; const server = spawn(helper, ['server', '--pipe', name], { windowsHide: true }); t.after(() => server.kill());
+  const initial = await connectPipe(`\\\\.\\pipe\\${name}`); initial.destroy();
+  const script = `
+$ErrorActionPreference='Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class PipeAclProbe {
+ [StructLayout(LayoutKind.Sequential)] struct SidAttributes { public IntPtr Sid; public uint Attributes; }
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern IntPtr CreateFile(string name,uint access,uint sharing,IntPtr security,uint disposition,uint flags,IntPtr template);
+ [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+ [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+ [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr memory);
+ [DllImport("advapi32.dll",SetLastError=true)] static extern bool OpenProcessToken(IntPtr process,uint access,out IntPtr token);
+ [DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)] static extern bool ConvertStringSidToSid(string text,out IntPtr sid);
+ [DllImport("advapi32.dll",SetLastError=true)] static extern bool CreateRestrictedToken(IntPtr original,uint flags,uint disableCount,IntPtr disabled,uint deleteCount,IntPtr deleted,uint restrictCount,ref SidAttributes restricted,out IntPtr token);
+ [DllImport("advapi32.dll",SetLastError=true)] static extern bool ImpersonateLoggedOnUser(IntPtr token);
+ [DllImport("advapi32.dll")] static extern bool RevertToSelf();
+ [DllImport("advapi32.dll")] static extern uint GetSecurityInfo(IntPtr handle,int type,uint info,out IntPtr owner,out IntPtr group,out IntPtr dacl,out IntPtr sacl,out IntPtr descriptor);
+ [DllImport("advapi32.dll",CharSet=CharSet.Unicode)] static extern bool ConvertSecurityDescriptorToStringSecurityDescriptor(IntPtr descriptor,uint revision,uint info,out IntPtr text,out uint size);
+ public static string Read(string name) {
+  IntPtr h=CreateFile(name,0x00020000,0,IntPtr.Zero,3,0,IntPtr.Zero);
+  if(h==new IntPtr(-1)) throw new Exception("Open pipe error "+Marshal.GetLastWin32Error());
+  IntPtr owner,group,dacl,sacl,descriptor;
+  try {
+   uint error=GetSecurityInfo(h,6,4,out owner,out group,out dacl,out sacl,out descriptor);
+   if(error!=0) throw new Exception("Read pipe ACL error "+error);
+   try { IntPtr text; uint size; if(!ConvertSecurityDescriptorToStringSecurityDescriptor(descriptor,1,4,out text,out size)) throw new Exception("Convert ACL failed"); try{return Marshal.PtrToStringUni(text);} finally{LocalFree(text);} }
+   finally{LocalFree(descriptor);}
+  } finally {CloseHandle(h);}
+ }
+ public static int TryRestricted(string name) {
+  IntPtr original=IntPtr.Zero,sid=IntPtr.Zero,restricted=IntPtr.Zero;
+  if(!OpenProcessToken(GetCurrentProcess(),10,out original)) throw new Exception("Open token failed");
+  try {
+   if(!ConvertStringSidToSid("S-1-5-7",out sid)) throw new Exception("Parse restricted SID failed");
+   SidAttributes restriction=new SidAttributes{Sid=sid,Attributes=0};
+   if(!CreateRestrictedToken(original,1,0,IntPtr.Zero,0,IntPtr.Zero,1,ref restriction,out restricted)) throw new Exception("Restricted token failed "+Marshal.GetLastWin32Error());
+   if(!ImpersonateLoggedOnUser(restricted)) throw new Exception("Impersonation failed");
+   try { IntPtr h=CreateFile(name,0x00020000,0,IntPtr.Zero,3,0,IntPtr.Zero); if(h==new IntPtr(-1)) return Marshal.GetLastWin32Error(); CloseHandle(h); return 0; }
+   finally {RevertToSelf();}
+  } finally {if(restricted!=IntPtr.Zero)CloseHandle(restricted);if(sid!=IntPtr.Zero)LocalFree(sid);CloseHandle(original);}
+ }
+}
+'@
+$sddl=[PipeAclProbe]::Read('\\\\.\\pipe\\${name}')
+$descriptor=New-Object Security.AccessControl.RawSecurityDescriptor($sddl)
+$rules=@($descriptor.DiscretionaryAcl | ForEach-Object { $_.SecurityIdentifier.Value })
+$restrictedError=[PipeAclProbe]::TryRestricted('\\\\.\\pipe\\${name}')
+$remote=New-Object IO.Pipes.NamedPipeClientStream($env:COMPUTERNAME,'${name}',[IO.Pipes.PipeDirection]::InOut)
+$remoteConnected=$false
+$remoteError=$null
+try { $remote.Connect(1500); $remoteConnected=$remote.IsConnected } catch { $remoteError=$_.Exception.Message } finally { $remote.Dispose() }
+@{ sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value; rules=$rules; sddl=$sddl; restrictedError=$restrictedError; remoteConnected=$remoteConnected; remoteError=$remoteError } | ConvertTo-Json -Compress
+`;
+  const result = await new Promise((resolve, reject) => {
+    const probe = spawn('powershell.exe', ['-NoProfile', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], { windowsHide: true }); let stdout = '', stderr = '';
+    probe.stdout.on('data', data => { stdout += data; }); probe.stderr.on('data', data => { stderr += data; }); probe.once('error', reject); probe.once('exit', code => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(stderr)));
+  });
+  assert.deepEqual(result.rules, [result.sid]); assert.match(result.sddl, /D:P/); assert.equal(result.restrictedError, 5); assert.equal(result.remoteConnected, false);
+});

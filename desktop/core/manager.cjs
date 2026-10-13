@@ -53,7 +53,7 @@ function createManager(options = {}) {
   }
   function requireIdle(toolId, ignoreId) {
     if (componentLocks.has(toolId) || [...Object.values(records.tasks), ...Object.values(records.operations)].some(t => t.id !== ignoreId && t.toolId === toolId && !FINISHED.has(t.state))) throw fault('TOOL_BUSY', '工具正在执行任务，请结束后再操作');
-    if (records.tools[toolId]?.status === 'running') throw fault('TOOL_BUSY', '请先停止工具预览再操作');
+    if (records.tools[toolId]?.status === 'running' && typeof options.onComponentStop !== 'function') throw fault('TOOL_BUSY', '请先停止工具预览再操作');
     if (options.onComponentBusy?.(toolId)) throw fault('TOOL_BUSY', '组件正在执行任务');
   }
   function toolView(tool) {
@@ -117,10 +117,12 @@ function createManager(options = {}) {
         controller.signal.throwIfAborted();
         const result = await fn(context);
         current = records[kind][item.id];
-        transition(kind, current, { state: controller.signal.aborted ? 'cancelled' : 'completed', result: result ?? null, progress: { ...current.progress, phase: controller.signal.aborted ? 'cancelled' : 'completed', percent: controller.signal.aborted ? current.progress.percent : 100 } });
+        // A fulfilled adapter confirms the real result, even when cancellation lost a race.
+        // Only an acknowledged abort/error reports cancelled; an AbortSignal alone is a request.
+        transition(kind, current, { state: 'completed', result: result ?? null, progress: { ...current.progress, phase: 'completed', percent: 100 } });
       } catch (error) {
         current = records[kind][item.id];
-        transition(kind, current, { state: controller.signal.aborted || error.code === 'CANCELLED' || error.name === 'AbortError' ? 'cancelled' : 'failed', error: { code: error.code || 'OPERATION_FAILED', message: error.message || String(error) } });
+        transition(kind, current, { state: error.code === 'CANCELLED' || error.name === 'AbortError' ? 'cancelled' : 'failed', error: { code: error.code || 'OPERATION_FAILED', message: error.message || String(error) } });
       } finally { controllers.delete(item.id); }
     });
     return clone(item);
@@ -175,6 +177,8 @@ function createManager(options = {}) {
     const previous = validActive(root, readJson(activeFile, null));
     if (previous?.version && semver.valid(tool.version) && semver.valid(previous.version) && semver.lt(tool.version, previous.version)) { componentLocks.delete(tool.id); throw fault('COMPONENT_DOWNGRADE', '目录提供了较旧的组件版本'); }
     try {
+      if (options.onComponentStop) await options.onComponentStop(tool.id);
+      context.signal.throwIfAborted();
       const disk = fs.statfsSync(root); if (Number(disk.bavail) * Number(disk.bsize) < tool.package.bytes * 3) throw fault('DISK_SPACE', '磁盘可用空间不足');
       transition('tools', records.tools[tool.id] || { id: tool.id }, { status: 'installing', error: null });
       const archive = await downloadVerified(tool.package, path.join(cacheRoot, `${tool.id}-${tool.version}-${tool.package.sha256.slice(0, 12)}.zip`), context);
