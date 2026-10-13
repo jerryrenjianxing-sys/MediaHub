@@ -1,1 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="16" fill="#131719"/><g fill="#70d6b9"><rect x="14" y="14" width="14" height="14" rx="4"/><rect x="36" y="14" width="14" height="14" rx="4"/><rect x="14" y="36" width="14" height="14" rx="4"/><path d="M41 36h4v5h5v4h-5v5h-4v-5h-5v-4h5z"/></g></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">MediaHub</title>
+  <rect width="64" height="64" rx="15" fill="#6355CF"/>
+  <path d="M14.5 45V22.5L32 35L49.5 22.5V45" fill="none" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="32" cy="35" r="6" fill="#DDD7FF"/>
+  <circle cx="32" cy="35" r="2.75" fill="#6355CF"/>
+</svg>

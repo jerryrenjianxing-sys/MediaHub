@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title">
+  <title id="title">MediaHub</title>
+  <rect width="64" height="64" rx="15" fill="#6355CF"/>
+  <path d="M14.5 45V22.5L32 35L49.5 22.5V45" fill="none" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="32" cy="35" r="6" fill="#DDD7FF"/>
+  <circle cx="32" cy="35" r="2.75" fill="#6355CF"/>
+</svg>
