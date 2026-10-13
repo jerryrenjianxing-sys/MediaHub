@@ -98,10 +98,10 @@ function cleanupTarget(entries, installRoot, root = ACCEPTANCE_ROOT) {
 function assertUninstallerIdentity(info, expectedVersion) {
   assert.equal(info.productName, 'MediaHub', 'Uninstaller PE identity is not MediaHub');
   assert.match(String(info.fileDescription || ''), /^MediaHub(?:$|\s)/, 'Uninstaller PE description is not MediaHub');
-  // NSIS uninstaller uses shortVersion in its PE resources, unlike the app PE.
+  // The actual NSIS artifact may use the full preview version or shortVersion.
   const expectedBase = expectedVersion.split('-')[0];
   const actual = String(info.fileVersion || '').trim();
-  assert.ok(actual === expectedBase || actual === `${expectedBase}.0`, 'Uninstaller PE version differs from the acceptance release');
+  assert.ok(actual === expectedVersion || actual === expectedBase || actual === `${expectedBase}.0`, 'Uninstaller PE version differs from the acceptance release');
 }
 async function registeredShortcuts(entries, installRoot) {
   const registration = entries.find(entry => entry.kind === 'install-root');
