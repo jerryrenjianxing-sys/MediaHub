@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "generatedAt": "2026-10-13T00:00:00.000Z",
+  "generatedAt": "2026-10-13T08:57:57.534Z",
   "tools": [
     {
       "id": "mediaflow",
@@ -126,8 +126,14 @@
       "links": {
         "home": "https://github.com/heygen-com/hyperframes",
         "update": "https://github.com/jerryrenjianxing-sys/MediaHub/releases"
+      },
+      "package": {
+        "url": "https://github.com/jerryrenjianxing-sys/MediaHub/releases/download/hyperframes-v0.1.0-preview.1/MediaHub-HyperFrames-0.1.0-preview.1-win-x64.zip",
+        "fileName": "MediaHub-HyperFrames-0.1.0-preview.1-win-x64.zip",
+        "sha256": "af28dc15dfeaad3d21f6561ab3c5158f380dcbcb302ebf6e9f95feef0087bb43",
+        "bytes": 297034361
       }
     }
   ],
-  "sequence": 1791876335999
+  "sequence": 1791881877535
 }
