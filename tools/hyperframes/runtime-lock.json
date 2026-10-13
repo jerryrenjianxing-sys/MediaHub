@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "versions": {
+    "tool": "0.1.0-preview.1",
+    "hyperframes": "0.8.151",
+    "node": "24.21.0",
+    "chrome": "152.0.7977.30",
+    "ffmpeg": "8.1.1",
+    "gsap": "3.14.2"
+  },
+  "sources": {
+    "node": {
+      "url": "https://nodejs.org/dist/v24.21.0/win-x64/node.exe",
+      "sha256": "ba4e6d110e8c1592a1ecd390f6b05f3da124b13871a5be62b341a07a853c6c32",
+      "license": "MIT and included third-party licenses"
+    },
+    "chrome": {
+      "url": "https://storage.googleapis.com/chrome-for-testing-public/152.0.7977.30/win64/chrome-headless-shell-win64.zip",
+      "archiveSha256": "5d7df999a6e4a65a1b16b25b61064f7337b8aa8ee2ed1b4e07bfdd24f6e4275e",
+      "license": "BSD-3-Clause and included Chromium credits"
+    },
+    "ffmpeg": {
+      "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-8.1.1-full_build.7z",
+      "hashes": {
+        "ffmpeg.exe": "09948d4cdd0650da6ff5a87577469f2a218dc2615ae379f8f734d24c49de0f73",
+        "ffprobe.exe": "a6618e99bb58869ded3c6f37b53aa1a8d701c3591dbb7b5b317d47369c112be2"
+      },
+      "license": "GPL-3.0-or-later",
+      "source": "https://github.com/FFmpeg/FFmpeg/commit/239f2c733d"
+    },
+    "font": {
+      "url": "https://raw.githubusercontent.com/google/fonts/66928797f271fed5ee428544e7229685e2d90127/ofl/notosanssc/NotoSansSC%5Bwght%5D.ttf",
+      "sha256": "a3041811a78c361b1de50f953c805e0244951c21c5bd412f7232ef0d899af0da",
+      "license": "OFL-1.1",
+      "sourceCommit": "66928797f271fed5ee428544e7229685e2d90127"
+    }
+  }
+}

@@ -1,0 +1,78 @@
+name: Windows build and acceptance
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      legacy:
+        description: Run original software installer acceptance on a clean runner
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile Win32 helper
+        shell: pwsh
+        run: ./scripts/build-native.ps1 -OutputDirectory ./build/native
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+      - name: Native transport and process tests
+        shell: pwsh
+        run: node --test tests/native*.test.cjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mediahub-native
+          path: build/native/mediahub-pipe.exe
+          if-no-files-found: error
+  platform:
+    needs: native
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+          cache: npm
+      - run: npm ci
+      - name: Install tool source test dependencies only
+        run: npm ci --prefix tools/hyperframes --ignore-scripts
+      - uses: actions/download-artifact@v4
+        with:
+          name: mediahub-native
+          path: build/native
+      - run: npm test
+      - run: npm run dist
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mediahub-platform
+          path: |
+            release/*.exe
+            release/*.zip
+            release/*.blockmap
+            release/*yml
+            release/platform-payload.json
+          if-no-files-found: error
+  legacy:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.legacy }}
+    runs-on: windows-2025
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.21.0'
+      - name: Install and identify original software in this disposable VM
+        shell: pwsh
+        run: ./scripts/accept-legacy.ps1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mediahub-legacy-acceptance
+          path: work/legacy-acceptance

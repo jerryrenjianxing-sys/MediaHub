@@ -1,0 +1,133 @@
+{
+  "schema": 1,
+  "generatedAt": "2026-10-13T00:00:00.000Z",
+  "tools": [
+    {
+      "id": "mediaflow",
+      "name": "MediaFlow",
+      "kind": "external",
+      "version": "0.4.1-dev.48",
+      "description": "素材采集、项目工作流与媒体任务。已有账号与业务数据继续由 MediaFlow 管理。",
+      "license": "MIT",
+      "management": "original",
+      "detection": {
+        "productNames": [
+          "MediaFlow"
+        ],
+        "executables": [
+          "%LOCALAPPDATA%/Programs/MediaFlow/MediaFlow.exe",
+          "%LOCALAPPDATA%/MediaFlow/MediaFlow.exe"
+        ],
+        "processNames": [
+          "MediaFlow"
+        ],
+        "dataPaths": [
+          "%LOCALAPPDATA%/MediaFlow"
+        ]
+      },
+      "install": {
+        "url": "https://github.com/jerryrenjianxing-sys/Media-Flow/releases/download/v0.4.1-dev.48/MediaFlow-0.4.1-dev.48-win-x64-Setup.exe",
+        "sha256": "d35e6eda359b32b9599477e17bc494d76a574fd4d28ce8710f8c0a7c80921b75",
+        "bytes": 205819349,
+        "fileName": "MediaFlow-0.4.1-dev.48-win-x64-Setup.exe"
+      },
+      "links": {
+        "home": "https://github.com/jerryrenjianxing-sys/Media-Flow",
+        "update": "https://github.com/jerryrenjianxing-sys/Media-Flow/releases"
+      }
+    },
+    {
+      "id": "media-deep-researcher",
+      "name": "Media Deep Researcher",
+      "kind": "external",
+      "version": "0.3.1",
+      "description": "媒体深度研究工作台。首版接入安装与打开，更新及卸载由原软件管理。",
+      "license": "Non-commercial learning license; see original project",
+      "management": "original",
+      "detection": {
+        "productNames": [
+          "Media Deep Researcher",
+          "MediaWorkbench",
+          "MediaWorkbench.Desktop"
+        ],
+        "executables": [
+          "%LOCALAPPDATA%/MediaWorkbench.Desktop/current/MediaWorkbench.exe",
+          "%LOCALAPPDATA%/Programs/MediaWorkbench/MediaWorkbench.exe"
+        ],
+        "processNames": [
+          "MediaWorkbench"
+        ],
+        "dataPaths": [
+          "%LOCALAPPDATA%/MediaWorkbench"
+        ]
+      },
+      "install": {
+        "url": "https://github.com/jerryrenjianxing-sys/lead-list-learning-edition/releases/download/v0.3.1/MediaWorkbench.Desktop-win-preview-Setup.exe",
+        "sha256": "e8a814be681f9bff15ff54710b37524e49bb5daf3b1c8e11adc06eb59c91494a",
+        "bytes": 724490109,
+        "fileName": "MediaWorkbench.Desktop-win-preview-Setup.exe"
+      },
+      "links": {
+        "home": "https://github.com/jerryrenjianxing-sys/lead-list-learning-edition",
+        "update": "https://github.com/jerryrenjianxing-sys/lead-list-learning-edition/releases"
+      }
+    },
+    {
+      "id": "mediasail",
+      "name": "MediaSail",
+      "kind": "external",
+      "version": "0.4.2",
+      "description": "媒体分析与创作工作台。保留原素材、浏览器会话和发布账号。安装包约 1.79 GB。",
+      "license": "Apache-2.0 and bundled dependency notices",
+      "management": "original",
+      "detection": {
+        "productNames": [
+          "MediaSail",
+          "ElectronEasel"
+        ],
+        "executables": [
+          "%LOCALAPPDATA%/Programs/MediaSail/MediaSail.exe",
+          "%LOCALAPPDATA%/Programs/mediasail/MediaSail.exe",
+          "%LOCALAPPDATA%/Programs/ElectronEasel/ElectronEasel.exe"
+        ],
+        "processNames": [
+          "MediaSail",
+          "ElectronEasel"
+        ],
+        "dataPaths": [
+          "%LOCALAPPDATA%/ElectronEasel"
+        ]
+      },
+      "install": {
+        "url": "https://github.com/jerryrenjianxing-sys/MediaSail/releases/download/v0.4.2/MediaSail-0.4.2-win-x64-Setup.exe",
+        "sha256": "8090a8f1bf2e32736e9b5316a08569b18a4524649328d8277132f2d2dd48eee7",
+        "bytes": 1786976397,
+        "fileName": "MediaSail-0.4.2-win-x64-Setup.exe"
+      },
+      "links": {
+        "home": "https://github.com/jerryrenjianxing-sys/MediaSail",
+        "update": "https://github.com/jerryrenjianxing-sys/MediaSail/releases"
+      }
+    },
+    {
+      "id": "hyperframes",
+      "name": "HyperFrames",
+      "kind": "component",
+      "version": "0.1.0-preview.1",
+      "upstreamVersion": "0.8.151",
+      "description": "本地 HTML 视频工具包，按需安装 Node、浏览器、FFmpeg、字体与动画依赖。支持预览、检查与 MP4 导出。",
+      "license": "Apache-2.0; runtime and asset licenses separately listed",
+      "management": "platform",
+      "component": {
+        "entry": "service-entry.mjs",
+        "node": "runtime/node/node.exe",
+        "manifest": "component-manifest.json"
+      },
+      "links": {
+        "home": "https://github.com/heygen-com/hyperframes",
+        "update": "https://github.com/jerryrenjianxing-sys/MediaHub/releases"
+      }
+    }
+  ],
+  "sequence": 1791876335999
+}

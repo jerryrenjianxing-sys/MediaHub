@@ -1,0 +1,6 @@
+interface:
+  display_name: "MediaHub"
+  short_description: "Discover and use tools, projects and assets in MediaHub"
+  default_prompt: "Use $mediahub to connect to my workbench and inspect the tools available for my task."
+policy:
+  allow_implicit_invocation: false
